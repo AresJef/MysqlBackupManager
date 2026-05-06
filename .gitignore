@@ -1,0 +1,77 @@
+# OS generated files #
+######################
+$RECYCLE.BIN
+$Recycle.Bin
+System Volume Information
+ehthumbs.db
+desktop.ini
+Thumbs.db
+lost+found
+.DocumentRevisions-V100
+.TemporaryItems
+.fseventsd
+.icloud
+.iCloud
+.DS_Store
+.DS_Store?
+.Spotlight-V100
+.Trashes
+.Trash-*
+.trashed-*
+~*
+*~
+.~lock.*
+*.part
+*.filepart
+.csync_journal.db
+.csync_journal.db.tmp
+
+# Compiled source #
+######################
+*.com
+*.class
+*.dll
+*.o
+*.c
+*.so
+*.swn
+*.swp
+*.swo
+
+# Packages #
+######################
+*.7z
+*.dmg
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Html #
+######################
+*.html
+
+# Logs and databases #
+######################
+*.log
+*.log.*
+*.sql
+*.sqlite
+
+# IDE settings #
+######################
+/.vscode
+/.idea
+/.venv
+
+# Python #
+######################
+__pycache__
+/build
+/dist
+*.egg-info
+*.tar.gz
+*.whl
+tempCodeRunnerFile.py
+.env

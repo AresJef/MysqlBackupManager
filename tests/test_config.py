@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from mysql_backup_manager.config import DumpConfig, MySQLConnectionConfig, RestoreConfig, ScheduleConfig
+from mysql_backup_manager.exceptions import BackupConfigError, RestoreConfigError
+
+
+def test_connection_password_is_hidden_and_loaded_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MYSQL_PWD", "secret")
+    config = MySQLConnectionConfig(user="root")
+
+    assert config.password_value() == "secret"
+    assert "secret" not in repr(config)
+
+
+def test_dump_config_requires_databases(tmp_path: Path) -> None:
+    with pytest.raises(BackupConfigError):
+        DumpConfig(databases=[], output_dir=tmp_path)
+
+
+def test_dump_config_creates_output_dir(tmp_path: Path) -> None:
+    output_dir = tmp_path / "nested" / "backups"
+
+    config = DumpConfig(databases=["app"], output_dir=output_dir)
+
+    assert config.output_dir.exists()
+
+
+def test_filename_template_requires_database_and_timestamp(tmp_path: Path) -> None:
+    with pytest.raises(BackupConfigError):
+        DumpConfig(databases=["app"], output_dir=tmp_path, filename_template="{database}.sql")
+
+
+def test_ignore_tables_must_be_db_dot_table(tmp_path: Path) -> None:
+    with pytest.raises(BackupConfigError):
+        DumpConfig(databases=["app"], output_dir=tmp_path, ignore_tables=["users"])
+
+
+def test_restore_config_accepts_sql_and_sql_gz(tmp_path: Path) -> None:
+    sql = tmp_path / "backup.sql"
+    sql_gz = tmp_path / "backup.sql.gz"
+    sql.write_text("select 1;", encoding="utf-8")
+    sql_gz.write_bytes(b"not really gzip for validation only")
+
+    assert RestoreConfig(input_file=sql).input_file == sql
+    assert RestoreConfig(input_file=sql_gz).input_file == sql_gz
+
+
+def test_restore_config_rejects_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(RestoreConfigError):
+        RestoreConfig(input_file=tmp_path / "missing.sql")
+
+
+def test_schedule_config_validation() -> None:
+    with pytest.raises(ValueError):
+        ScheduleConfig(enabled=True)
+    with pytest.raises(ValueError):
+        ScheduleConfig(enabled=True, cron="0 3 * * *", interval_seconds=60)
+
+
+
+
+def test_dump_config_rejects_empty_mysqldump_path(tmp_path: Path) -> None:
+    with pytest.raises(BackupConfigError):
+        DumpConfig(databases=["app"], output_dir=tmp_path, mysqldump_path="   ")
+
+
+def test_restore_config_rejects_empty_mysql_path(tmp_path: Path) -> None:
+    sql = tmp_path / "backup.sql"
+    sql.write_text("select 1;", encoding="utf-8")
+    with pytest.raises(RestoreConfigError):
+        RestoreConfig(input_file=sql, mysql_path="   ")
+
+
+
+def test_schedule_config_rejects_invalid_cron_and_timezone() -> None:
+    with pytest.raises(ValueError):
+        ScheduleConfig(enabled=True, cron="not cron")
+    with pytest.raises(ValueError):
+        ScheduleConfig(enabled=True, interval_seconds=60, timezone="No/SuchZone")
+
+
+def test_config_normalizes_connection_and_database_names(tmp_path: Path) -> None:
+    connection = MySQLConnectionConfig(host=" db ", user=" root ", socket=" /tmp/mysql.sock ")
+    dump = DumpConfig(databases=[" app "], output_dir=tmp_path)
+    sql = tmp_path / "backup.sql"
+    sql.write_text("select 1;", encoding="utf-8")
+    restore = RestoreConfig(database=" app ", input_file=sql)
+
+    assert connection.host == "db"
+    assert connection.user == "root"
+    assert connection.socket == "/tmp/mysql.sock"
+    assert dump.databases == ["app"]
+    assert restore.database == "app"
+
+
+def test_extra_options_reject_password_arguments(tmp_path: Path) -> None:
+    sql = tmp_path / "backup.sql"
+    sql.write_text("select 1;", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        DumpConfig(databases=["app"], output_dir=tmp_path, extra_options=["--password=secret"])
+    with pytest.raises(ValueError):
+        RestoreConfig(input_file=sql, extra_options=["-psecret"])
+
+
+def test_retention_match_pattern_must_stay_inside_output_dir() -> None:
+    from mysql_backup_manager.config import RetentionConfig
+
+    with pytest.raises(ValueError):
+        RetentionConfig(match_pattern="../*.sql")
