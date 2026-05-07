@@ -1,5 +1,7 @@
 # mysql-backup-manager
 
+Created to be used in a project, this package is published to github for ease of management and installation across different modules.
+
 `mysql-backup-manager` is a Python library for backing up and restoring MySQL databases with the native MySQL client tools.
 
 It uses:
