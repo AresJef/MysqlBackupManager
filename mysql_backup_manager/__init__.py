@@ -1,4 +1,10 @@
-"""Reusable MySQL backup and restore library."""
+"""Public package API for mysql-backup-manager.
+
+Import from this module in application code when you want the stable, supported
+surface of the library. The package exposes configuration models, service
+classes, result models, and the high-level ``MySQLBackupManager`` facade while
+installing only a ``NullHandler`` so applications remain in control of logging.
+"""
 
 from __future__ import annotations
 

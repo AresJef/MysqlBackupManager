@@ -3,6 +3,8 @@ from __future__ import annotations
 import gzip
 from pathlib import Path
 
+import pytest
+
 from mysql_backup_manager.checksum import compute_checksum, write_checksum_file
 from mysql_backup_manager.compression import gzip_file, open_sql_input
 
@@ -31,4 +33,15 @@ def test_gzip_compression_and_decompression(tmp_path: Path) -> None:
         assert file.read() == "select 1;\n"
     with open_sql_input(compressed) as file:
         assert file.read() == b"select 1;\n"
+
+
+def test_helper_verify_checksum_rejects_empty_sidecar(tmp_path: Path) -> None:
+    from mysql_backup_manager.helper import verify_checksum
+
+    backup = tmp_path / "backup.sql.gz"
+    backup.write_bytes(b"backup")
+    backup.with_name(f"{backup.name}.sha256").write_text("", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="empty or invalid"):
+        verify_checksum(backup)
 

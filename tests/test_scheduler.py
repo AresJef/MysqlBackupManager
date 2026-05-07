@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+
+import pytest
 
 from mysql_backup_manager.config import ScheduleConfig
+from mysql_backup_manager.exceptions import SchedulerError
 from mysql_backup_manager.scheduler import SchedulerService
 
 
@@ -26,6 +30,7 @@ class _Manager:
 
     async def cleanup_retention(self):
         self.cleanup_calls += 1
+        return SimpleNamespace(success=True, error=None, deleted_files=[], kept_files=[])
 
 
 async def test_scheduler_skips_overlapping_run() -> None:
@@ -61,3 +66,43 @@ async def test_scheduler_returns_false_when_run_fails() -> None:
     result = await scheduler.run_once()
 
     assert result is False
+
+
+class _FailedResultManager:
+    def __init__(self) -> None:
+        self.retention = _Retention()
+        self.cleanup_calls = 0
+
+    async def backup_all(self):
+        return [
+            SimpleNamespace(
+                success=False,
+                database="app",
+                error="bad credentials",
+                stderr="Access denied",
+            )
+        ]
+
+    async def cleanup_retention(self):
+        self.cleanup_calls += 1
+
+
+async def test_scheduler_returns_false_when_backup_result_fails() -> None:
+    manager = _FailedResultManager()
+    scheduler = SchedulerService(manager, ScheduleConfig(enabled=True, interval_seconds=60))
+
+    result = await scheduler.run_once()
+
+    assert result is False
+    assert manager.cleanup_calls == 0
+
+
+async def test_scheduler_run_forever_raises_when_stop_on_failure_enabled() -> None:
+    manager = _FailedResultManager()
+    scheduler = SchedulerService(
+        manager,
+        ScheduleConfig(enabled=True, interval_seconds=60, run_immediately=True),
+    )
+
+    with pytest.raises(SchedulerError, match=r"`app`: bad credentials"):
+        await scheduler.run_forever(stop_on_failure=True)

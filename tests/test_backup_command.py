@@ -24,6 +24,7 @@ def test_mysqldump_command_contains_expected_options_without_password(tmp_path: 
     assert "--events" in command
     assert "--add-drop-table" in command
     assert "--default-character-set=utf8mb4" in command
+    assert "--connect-timeout=10" not in command
     assert command[-1] == "app"
     assert "secret" not in " ".join(command)
     assert not any(arg.startswith("--password") for arg in command)

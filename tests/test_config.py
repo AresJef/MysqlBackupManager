@@ -112,3 +112,79 @@ def test_retention_match_pattern_must_stay_inside_output_dir() -> None:
 
     with pytest.raises(ValueError):
         RetentionConfig(match_pattern="../*.sql")
+
+
+def test_output_dir_expands_user_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    config = DumpConfig(databases=["app"], output_dir=Path("~/backups"))
+
+    assert config.output_dir == tmp_path / "backups"
+    assert config.output_dir.exists()
+
+
+def test_restore_input_file_expands_user_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sql = tmp_path / "backup.sql"
+    sql.write_text("select 1;", encoding="utf-8")
+
+    config = RestoreConfig(input_file=Path("~/backup.sql"))
+
+    assert config.input_file == sql
+
+
+def test_restore_database_rejects_null_byte(tmp_path: Path) -> None:
+    sql = tmp_path / "backup.sql"
+    sql.write_text("select 1;", encoding="utf-8")
+
+    with pytest.raises(RestoreConfigError):
+        RestoreConfig(database="bad\x00name", input_file=sql)
+
+
+def test_restore_create_database_requires_database(tmp_path: Path) -> None:
+    sql = tmp_path / "backup.sql"
+    sql.write_text("select 1;", encoding="utf-8")
+
+    with pytest.raises(RestoreConfigError):
+        RestoreConfig(input_file=sql, create_database_if_missing=True)
+
+
+def test_filename_template_rejects_complex_field_access(tmp_path: Path) -> None:
+    with pytest.raises(BackupConfigError):
+        DumpConfig(
+            databases=["app"],
+            output_dir=tmp_path,
+            filename_template="{database.__class__}_{timestamp}.sql",
+        )
+
+
+def test_restore_config_rejects_directory_input_file(tmp_path: Path) -> None:
+    directory_named_sql = tmp_path / "backup.sql"
+    directory_named_sql.mkdir()
+
+    with pytest.raises(RestoreConfigError):
+        RestoreConfig(input_file=directory_named_sql)
+
+
+def test_extra_options_are_stripped_and_blank_options_rejected(tmp_path: Path) -> None:
+    sql = tmp_path / "backup.sql"
+    sql.write_text("select 1;", encoding="utf-8")
+
+    dump = DumpConfig(databases=["app"], output_dir=tmp_path, extra_options=[" --quick "])
+    restore = RestoreConfig(input_file=sql, extra_options=[" --binary-mode "])
+
+    assert dump.extra_options == ["--quick"]
+    assert restore.extra_options == ["--binary-mode"]
+    with pytest.raises(ValueError):
+        DumpConfig(databases=["app"], output_dir=tmp_path, extra_options=["   "])
+
+
+def test_executable_paths_are_stripped(tmp_path: Path) -> None:
+    sql = tmp_path / "backup.sql"
+    sql.write_text("select 1;", encoding="utf-8")
+
+    dump = DumpConfig(databases=["app"], output_dir=tmp_path, mysqldump_path=" mysqldump ")
+    restore = RestoreConfig(input_file=sql, mysql_path=" mysql ")
+
+    assert dump.mysqldump_path == "mysqldump"
+    assert restore.mysql_path == "mysql"

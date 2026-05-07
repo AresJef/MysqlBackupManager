@@ -19,6 +19,7 @@ The package is built for application code, scheduled jobs, and operational tooli
 - [Restore Usage](#restore-usage)
 - [Retention Cleanup](#retention-cleanup)
 - [Scheduled Backups](#scheduled-backups)
+- [Helper Functions](#helper-functions)
 - [Configuration Reference](#configuration-reference)
 - [Result Models](#result-models)
 - [Logging](#logging)
@@ -41,6 +42,8 @@ mysql --version
 ```
 
 If they are not on `PATH`, pass custom executable paths with `DumpConfig.mysqldump_path` and `RestoreConfig.mysql_path`.
+
+Paths such as `Path("~/Downloads/backups")` are expanded with `Path.expanduser()`.
 
 ## Installation
 
@@ -359,7 +362,7 @@ The password will not appear in the command.
 
 Restores are handled by `RestoreConfig`, `RestoreService`, and the manager restore methods.
 
-### Restore Into a Specific Database
+### Restore Into an Existing Database
 
 ```python
 from pathlib import Path
@@ -374,7 +377,29 @@ restore_config = RestoreConfig(
 )
 ```
 
-When `database` is set, the generated `mysql` command ends with that database name.
+When `database` is set and `create_database_if_missing=False`, the generated `mysql` command ends with that database name. MySQL requires that database to already exist.
+
+### Restore Into a New Database
+
+If you want to restore a dump into a database that may not exist yet, enable `create_database_if_missing`:
+
+```python
+result = manager.restore_sync(
+    RestoreConfig(
+        database="app_copy",
+        input_file=Path("./backups/app_20260506_120000.sql.gz"),
+        create_database_if_missing=True,
+        command_timeout=3600,
+    )
+)
+```
+
+With this option enabled, the restore command connects without a database argument and prefixes the SQL stream with:
+
+```sql
+CREATE DATABASE IF NOT EXISTS `app_copy`;
+USE `app_copy`;
+```
 
 ### Let the SQL File Select the Database
 
@@ -397,6 +422,40 @@ RestoreConfig(input_file=Path("./backups/app.sql.gz"))
 ```
 
 For `.sql.gz`, the file is decompressed as it is streamed into `mysql`.
+
+### Restore Dumps With GTID_PURGED Statements
+
+Some MySQL servers add `SET @@GLOBAL.GTID_PURGED=...` to dumps. Restoring that dump into a server that already has overlapping GTID history can fail with an error like:
+
+```text
+ERROR 3546 (HY000): @@GLOBAL.GTID_PURGED cannot be changed
+```
+
+For non-replication restores, test restores, or restoring into a new local database, enable `strip_gtid_purged`. The filter removes actual `@@GLOBAL.GTID_PURGED` statements while preserving normal data rows that merely mention `GTID_PURGED`:
+
+```python
+result = manager.restore_sync(
+    RestoreConfig(
+        database="app_copy",
+        input_file=Path("./backups/app.sql.gz"),
+        create_database_if_missing=True,
+        strip_gtid_purged=True,
+        command_timeout=3600,
+    )
+)
+```
+
+For future backups where GTID state is not needed, you can also prevent the line at backup time:
+
+```python
+DumpConfig(
+    databases=["app"],
+    output_dir=Path("./backups"),
+    set_gtid_purged="OFF",
+)
+```
+
+Do not strip GTID state for replication bootstrap workflows unless you understand the GTID implications.
 
 ### Async Restore
 
@@ -475,12 +534,12 @@ print("Deleted:", result.deleted_files)
 print("Kept:", result.kept_files)
 ```
 
-Retention rules are additive. If both `keep_last` and `keep_days` are set, a file is kept when it satisfies either rule:
+Retention rules are deletion limits. If both `keep_last` and `keep_days` are set, a backup is deleted when it exceeds either limit:
 
-- It is among the newest `keep_last` files.
-- It is newer than `keep_days` days.
+- It is beyond the newest `keep_last` backup artifacts.
+- It is older than `keep_days` days.
 
-Files outside `output_dir` are never deleted.
+Set either option to `None` to disable that specific rule. For example, `keep_last=5, keep_days=None` keeps only the newest 5 matching backup artifacts. Files outside `output_dir` are never deleted.
 
 ## Scheduled Backups
 
@@ -548,6 +607,63 @@ scheduler = SchedulerService(
 
 The scheduler skips a run if the previous backup is still active.
 
+
+## Helper Functions
+
+The package also includes `mysql_backup_manager.helper`, a small helper module for common replica-bootstrap workflows. These functions are ordinary Python helpers, not CLI commands, and they are not imported into the package root by default.
+
+Use them when you want concise one-off backup, restore, or scheduled backup functions without manually constructing the manager each time:
+
+```python
+from pathlib import Path
+
+from mysql_backup_manager.helper import backup, restore, scheduled_backup, verify_checksum
+
+backup_file = backup(
+    backup_dir=Path("~/Downloads/replica-bootstrap"),
+    database="app",
+    host="source.example.com",
+    port=3306,
+    user="backup_user",
+    password="secret",
+    command_timeout=7200,
+)
+
+verify_checksum(backup_file)
+
+restore(
+    backup_file=backup_file,
+    database="app",
+    host="replica.example.com",
+    port=3306,
+    user="restore_user",
+    password="secret",
+    command_timeout=7200,
+)
+```
+
+For scheduled helper backups, pass either `interval_seconds` or `cron`. Cron schedules use `timezone`; interval schedules simply wait the configured number of seconds.
+
+```python
+from mysql_backup_manager.helper import scheduled_backup
+
+scheduled_backup(
+    backup_dir="~/Downloads/backups",
+    database="app",
+    host="localhost",
+    port=3306,
+    user="root",
+    password="secret",
+    cron="0 2 * * *",
+    timezone="Asia/Shanghai",
+    run_immediately=False,
+    keep_last=5,
+    keep_days=7,
+)
+```
+
+The helper backup uses gzip compression, SHA-256 checksums, `--databases`, `--quick`, `--hex-blob`, and `--set-gtid-purged=ON`. The helper restore verifies the adjacent `.sha256` file first and restores with `database=None`, so the dump should contain its own `CREATE DATABASE`/`USE` statements. For custom behavior, use `MySQLBackupManager`, `DumpConfig`, and `RestoreConfig` directly.
+
 ## Configuration Reference
 
 ### `MySQLConnectionConfig`
@@ -560,7 +676,7 @@ The scheduler skips a run if the previous backup is still active.
 | `password` | `None` | Optional password. Hidden from repr and command args. |
 | `socket` | `None` | Optional Unix socket path. |
 | `default_character_set` | `"utf8mb4"` | Passed as `--default-character-set`. |
-| `connect_timeout` | `10` | Passed as `--connect-timeout`. |
+| `connect_timeout` | `10` | MySQL client connection timeout. Used by restore commands; `mysqldump` compatibility varies, so backup runtime should be bounded with `DumpConfig.command_timeout`. |
 
 ### `DumpConfig`
 
@@ -600,6 +716,8 @@ The scheduler skips a run if the previous backup is still active.
 | `input_file` | required | `.sql` or `.sql.gz` file. Must exist. |
 | `mysql_path` | `"mysql"` | Path or executable name for `mysql`. |
 | `command_timeout` | `None` | Optional subprocess timeout in seconds. |
+| `create_database_if_missing` | `False` | Create and select `database` before streaming the dump. Requires `database` and is useful when restoring into a new database. |
+| `strip_gtid_purged` | `False` | Remove dump statements that mutate `@@GLOBAL.GTID_PURGED` while streaming restore input. Useful for non-replication restores into servers with existing GTID history. |
 | `force` | `False` | Add `--force`. |
 | `extra_options` | `[]` | Raw options appended before database name. |
 | `decompress` | `True` | Decompress `.sql.gz` while streaming into `mysql`. |
@@ -621,8 +739,8 @@ Use either `cron` or `interval_seconds`, not both. If `enabled=True`, one of the
 | Field | Default | Description |
 | --- | --- | --- |
 | `enabled` | `True` | Whether cleanup is enabled. |
-| `keep_last` | `10` | Keep newest matching files. |
-| `keep_days` | `30` | Keep files newer than this many days. |
+| `keep_last` | `10` | Delete matching backup artifacts beyond the newest N files. Use `None` to disable. |
+| `keep_days` | `30` | Delete matching backup artifacts older than this many days. Use `None` to disable. |
 | `match_pattern` | `"*.sql*"` | Glob pattern inside `output_dir`. |
 
 ## Result Models

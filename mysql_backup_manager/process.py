@@ -1,4 +1,10 @@
-"""Async subprocess execution for native MySQL client tools."""
+"""Async subprocess execution for native MySQL client tools.
+
+This module is the only place that starts ``mysqldump`` or ``mysql`` processes.
+It always uses ``asyncio.create_subprocess_exec`` with argument lists instead of
+``shell=True``, streams large inputs/outputs instead of buffering them in memory,
+and returns stderr for structured result models.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +22,18 @@ from mysql_backup_manager.exceptions import (
 
 
 def build_env(password: str | None = None) -> dict[str, str]:
-    """Build a subprocess environment with MYSQL_PWD when needed."""
+    """Return a subprocess environment containing ``MYSQL_PWD`` when needed.
+
+    :param password: Optional MySQL password. Pass ``None`` when authentication is handled by socket, option files, or existing environment settings.
+    :return: A copy of ``os.environ`` with ``MYSQL_PWD`` set only when ``password`` is provided.
+
+    ## Example:
+    ```python
+    env = build_env("secret")
+    env["MYSQL_PWD"]
+    # 'secret'
+    ```
+    """
 
     env = os.environ.copy()
     if password:
@@ -25,6 +42,13 @@ def build_env(password: str | None = None) -> dict[str, str]:
 
 
 async def _stop_process(process: asyncio.subprocess.Process, *tasks: asyncio.Task[object]) -> None:
+    """Terminate a subprocess and cancel helper tasks during error handling.
+
+    :param process: Subprocess returned by ``asyncio.create_subprocess_exec``.
+    :param tasks: Helper tasks that should be cancelled after the process is stopped.
+    :return: None. The process is waited on and tasks are gathered with exceptions captured.
+    """
+
     if process.returncode is None:
         process.kill()
     with suppress(Exception):
@@ -36,6 +60,43 @@ async def _stop_process(process: asyncio.subprocess.Process, *tasks: asyncio.Tas
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def _finish_after_stdin_error(
+    process: asyncio.subprocess.Process,
+    feed_task: asyncio.Task[object],
+    stderr_task: asyncio.Task[bytes],
+) -> bytes:
+    """Collect useful stderr when ``mysql`` closes stdin early.
+
+    :param process: Running or recently exited mysql subprocess.
+    :param feed_task: Task that was streaming SQL into process stdin.
+    :param stderr_task: Task reading process stderr.
+    :return: Captured stderr bytes when available, otherwise ``b""``.
+    """
+
+    if not feed_task.done():
+        feed_task.cancel()
+    await asyncio.gather(feed_task, return_exceptions=True)
+
+    if process.returncode is None:
+        with suppress(TimeoutError):
+            await asyncio.wait_for(process.wait(), timeout=1.0)
+    if process.returncode is None:
+        process.kill()
+        with suppress(Exception):
+            await process.wait()
+
+    if not stderr_task.done():
+        with suppress(TimeoutError):
+            await asyncio.wait_for(stderr_task, timeout=1.0)
+    if stderr_task.done() and not stderr_task.cancelled():
+        result = stderr_task.result()
+        return result if isinstance(result, bytes) else b""
+
+    stderr_task.cancel()
+    await asyncio.gather(stderr_task, return_exceptions=True)
+    return b""
+
+
 async def run_command_to_file(
     command: list[str],
     output_file: Path,
@@ -44,7 +105,22 @@ async def run_command_to_file(
     timeout: float | None = None,
     not_found: type[Exception] = MySQLDumpNotFoundError,
 ) -> str:
-    """Run a command and stream stdout directly to a file."""
+    """Run ``command`` and stream stdout directly into ``output_file``.
+
+    :param command: Argument vector for a native executable, usually ``mysqldump``.
+    :param output_file: File that receives stdout bytes.
+    :param env: Optional subprocess environment, typically from ``build_env``.
+    :param timeout: Optional maximum runtime in seconds.
+    :param not_found: Exception type raised when ``command[0]`` cannot be executed.
+    :return: Captured stderr decoded as text. MySQL clients often write warnings to stderr even when the command succeeds.
+    :raises MySQLDumpNotFoundError: By default, when the executable is missing.
+    :raises MySQLCommandError: If the process times out or exits with a non-zero status.
+
+    ## Example:
+    ```python
+    # stderr = await run_command_to_file(["mysqldump", "--help"], Path("out.txt"))
+    ```
+    """
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -57,10 +133,15 @@ async def run_command_to_file(
         raise not_found(f"Executable not found: {command[0]}") from exc
 
     async def copy_stdout() -> None:
+        """Copy subprocess stdout to the target file in streaming chunks.
+
+        :return: None after stdout reaches EOF.
+        """
+
         assert process.stdout is not None
         with output_file.open("wb") as target:
             while chunk := await process.stdout.read(1024 * 1024):
-                target.write(chunk)
+                await asyncio.to_thread(target.write, chunk)
 
     assert process.stderr is not None
     copy_task = asyncio.create_task(copy_stdout())
@@ -96,7 +177,23 @@ async def run_command_with_input(
     timeout: float | None = None,
     not_found: type[Exception] = MySQLClientNotFoundError,
 ) -> str:
-    """Run a command and stream bytes into stdin."""
+    """Run ``command`` and stream ``input_stream`` into stdin.
+
+    :param command: Argument vector for a native executable, usually ``mysql``.
+    :param input_stream: Binary stream that yields SQL bytes via ``read``.
+    :param env: Optional subprocess environment, typically from ``build_env``.
+    :param timeout: Optional maximum runtime in seconds.
+    :param not_found: Exception type raised when ``command[0]`` cannot be executed.
+    :return: Captured stderr decoded as text.
+    :raises MySQLClientNotFoundError: By default, when the executable is missing.
+    :raises MySQLCommandError: If the process times out, exits non-zero, or closes stdin before the SQL stream has been fully written.
+
+    ## Example:
+    ```python
+    # with Path("backup.sql").open("rb") as stream:
+    #     stderr = await run_command_with_input(["mysql", "app"], stream)
+    ```
+    """
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -109,8 +206,13 @@ async def run_command_with_input(
         raise not_found(f"Executable not found: {command[0]}") from exc
 
     async def feed_stdin() -> None:
+        """Feed SQL bytes into subprocess stdin until the stream is exhausted.
+
+        :return: None after all input bytes are written and stdin is closed.
+        """
+
         assert process.stdin is not None
-        while chunk := input_stream.read(1024 * 1024):
+        while chunk := await asyncio.to_thread(input_stream.read, 1024 * 1024):
             process.stdin.write(chunk)
             await process.stdin.drain()
         process.stdin.close()
@@ -126,11 +228,11 @@ async def run_command_with_input(
         await _stop_process(process, feed_task, stderr_task)
         raise MySQLCommandError("Command timed out", stderr=None) from exc
     except (BrokenPipeError, ConnectionResetError) as exc:
-        await _stop_process(process, feed_task, stderr_task)
-        stderr_bytes = stderr_task.result() if stderr_task.done() and not stderr_task.cancelled() else b""
+        stderr_bytes = await _finish_after_stdin_error(process, feed_task, stderr_task)
         stderr = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+        detail = stderr.strip().splitlines()[-1] if stderr.strip() else "mysql closed stdin before all restore input was written"
         raise MySQLCommandError(
-            "Command closed stdin before restore input was fully written",
+            f"Command failed while streaming restore input: {detail}",
             returncode=process.returncode,
             stderr=stderr,
         ) from exc

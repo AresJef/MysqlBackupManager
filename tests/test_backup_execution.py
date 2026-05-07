@@ -50,7 +50,6 @@ async def test_backup_passes_command_timeout(monkeypatch: pytest.MonkeyPatch, tm
     assert result.output_file.read_text(encoding="utf-8") == "dump"
 
 
-
 async def test_compressed_backup_respects_overwrite_false(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     async def fake_run(command, output_file, **kwargs):
         raise AssertionError("mysqldump should not run when target exists")
@@ -106,3 +105,39 @@ async def test_manager_backup_database_strips_input(monkeypatch: pytest.MonkeyPa
     result = await manager.backup_database(" app ")
 
     assert result is not None
+
+
+def test_public_time_helpers_are_no_longer_exported_from_backup_module() -> None:
+    import mysql_backup_manager.backup as backup_module
+    from mysql_backup_manager import utils
+
+    assert backup_module.utc_now is utils.utc_now
+    assert backup_module.elapsed_seconds is utils.elapsed_seconds
+
+
+async def test_compressed_backup_respects_existing_uncompressed_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def fake_run(command, output_file, **kwargs):
+        raise AssertionError("mysqldump should not run when uncompressed staging target exists")
+
+    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    existing = tmp_path / "app_fixed.sql"
+    existing.write_text("existing", encoding="utf-8")
+    service = BackupService(
+        MySQLConnectionConfig(user="root"),
+        DumpConfig(
+            databases=["app"],
+            output_dir=tmp_path,
+            filename_template="{database}_{timestamp}.sql",
+            timestamp_format="fixed",
+            compress=True,
+            overwrite=False,
+        ),
+    )
+
+    result = await service.backup_database("app")
+
+    assert result.success is False
+    assert result.output_file == existing
+    assert result.compressed_file is None
+    assert "already exists" in (result.error or "")
+    assert existing.read_text(encoding="utf-8") == "existing"
