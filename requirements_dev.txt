@@ -1,0 +1,6 @@
+# Project dependencies
+pydantic>=2
+croniter>=2
+# Development dependencies
+pytest>=8
+pytest-asyncio>=0.23
