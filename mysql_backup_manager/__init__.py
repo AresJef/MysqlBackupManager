@@ -24,6 +24,7 @@ from mysql_backup_manager.models import BackupResult, RestoreResult, RetentionRe
 from mysql_backup_manager.restore import RestoreService
 from mysql_backup_manager.retention import RetentionService
 from mysql_backup_manager.scheduler import SchedulerService
+from mysql_backup_manager.helper import backup, restore, scheduled_backup
 
 __all__ = [
     "BackupResult",
@@ -39,4 +40,7 @@ __all__ = [
     "RetentionService",
     "ScheduleConfig",
     "SchedulerService",
+    "backup",
+    "restore",
+    "scheduled_backup",
 ]
