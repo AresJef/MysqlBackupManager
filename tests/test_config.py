@@ -183,8 +183,17 @@ def test_executable_paths_are_stripped(tmp_path: Path) -> None:
     sql = tmp_path / "backup.sql"
     sql.write_text("select 1;", encoding="utf-8")
 
-    dump = DumpConfig(databases=["app"], output_dir=tmp_path, mysqldump_path=" mysqldump ")
+    dump = DumpConfig(
+        databases=["app"],
+        output_dir=tmp_path,
+        mysqldump_path=" mysqldump ",
+        mysql_path=" /usr/local/bin/mysql ",
+    )
     restore = RestoreConfig(input_file=sql, mysql_path=" mysql ")
 
     assert dump.mysqldump_path == "mysqldump"
+    assert dump.mysql_path == "/usr/local/bin/mysql"
+    assert dump.validate_database_exists is True
+    assert dump.validate_database_has_objects is True
+    assert dump.validate_dump_content is True
     assert restore.mysql_path == "mysql"

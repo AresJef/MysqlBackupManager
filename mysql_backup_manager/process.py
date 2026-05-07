@@ -97,6 +97,61 @@ async def _finish_after_stdin_error(
     return b""
 
 
+async def run_command_capture(
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+    not_found: type[Exception] = MySQLClientNotFoundError,
+) -> tuple[str, str]:
+    """Run ``command`` and capture stdout and stderr as text.
+
+    :param command: Argument vector for a native executable, usually ``mysql``.
+    :param env: Optional subprocess environment, typically from ``build_env``.
+    :param timeout: Optional maximum runtime in seconds.
+    :param not_found: Exception type raised when ``command[0]`` cannot be executed.
+    :return: Tuple of ``(stdout, stderr)`` decoded with replacement for invalid bytes.
+    :raises MySQLClientNotFoundError: By default, when the executable is missing.
+    :raises MySQLCommandError: If the process times out or exits with a non-zero status.
+
+    ## Example:
+    ```python
+    # stdout, stderr = await run_command_capture(["mysql", "--version"])
+    ```
+    """
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise not_found(f"Executable not found: {command[0]}") from exc
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(), timeout=timeout
+        )
+    except TimeoutError as exc:
+        await _stop_process(process)
+        raise MySQLCommandError("Command timed out", stderr=None) from exc
+    except asyncio.CancelledError:
+        await _stop_process(process)
+        raise
+
+    stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else ""
+    stderr = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+    if process.returncode != 0:
+        raise MySQLCommandError(
+            f"Command failed with exit code {process.returncode}",
+            returncode=process.returncode,
+            stderr=stderr,
+        )
+    return stdout, stderr
+
+
 async def run_command_to_file(
     command: list[str],
     output_file: Path,

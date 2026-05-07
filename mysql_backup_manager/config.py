@@ -162,7 +162,11 @@ class DumpConfig(BaseModel):
     :param filename_template: Template used for uncompressed SQL filenames. It must include ``{database}`` and ``{timestamp}`` and render to a plain filename.
     :param timestamp_format: ``datetime.strftime`` format used by ``filename_template``.
     :param mysqldump_path: Executable name or absolute path for ``mysqldump``.
+    :param mysql_path: Executable name or absolute path for ``mysql`` used by backup preflight validation.
     :param command_timeout: Optional maximum runtime, in seconds, for each dump command.
+    :param validate_database_exists: Check that the database exists and is visible to the configured user before running ``mysqldump``.
+    :param validate_database_has_objects: Check that at least one table or view is visible before running ``mysqldump``. Disable this only when backing up intentionally empty databases.
+    :param validate_dump_content: Check that the produced SQL contains table/view definitions or row data when visible objects exist.
     :param single_transaction: Add ``--single-transaction`` for consistent InnoDB dumps.
     :param routines: Include stored routines.
     :param triggers: Include triggers.
@@ -200,7 +204,11 @@ class DumpConfig(BaseModel):
     filename_template: str = "{database}_{timestamp}.sql"
     timestamp_format: str = "%Y%m%d_%H%M%S"
     mysqldump_path: str = "mysqldump"
+    mysql_path: str = "mysql"
     command_timeout: float | None = Field(default=None, gt=0)
+    validate_database_exists: bool = True
+    validate_database_has_objects: bool = True
+    validate_dump_content: bool = True
     single_transaction: bool = True
     routines: bool = True
     triggers: bool = True
@@ -278,21 +286,21 @@ class DumpConfig(BaseModel):
             raise BackupConfigError("filename_template must only use {database} and {timestamp}") from exc
         return value
 
-    @field_validator("mysqldump_path")
+    @field_validator("mysqldump_path", "mysql_path")
     @classmethod
-    def mysqldump_path_must_not_be_empty(cls, value: str) -> str:
-        """Ensure the mysqldump executable path/name is not blank.
+    def executable_path_must_not_be_empty(cls, value: str) -> str:
+        """Ensure native client executable path/name fields are not blank.
 
-        :param value: Executable name or path supplied to ``mysqldump_path``.
-        :return: The validated value.
-        :raises BackupConfigError: If the value is empty or whitespace only.
+        :param value: Executable name or path supplied to ``mysqldump_path`` or ``mysql_path``.
+        :return: The stripped executable name or path.
+        :raises BackupConfigError: If the value is empty, whitespace only, or contains a null byte.
         """
 
         stripped = value.strip()
         if not stripped:
-            raise BackupConfigError("mysqldump_path must not be empty")
+            raise BackupConfigError("native client executable paths must not be empty")
         if "\x00" in stripped:
-            raise BackupConfigError("mysqldump_path must not contain null bytes")
+            raise BackupConfigError("native client executable paths must not contain null bytes")
         return stripped
 
     @field_validator("ignore_tables")

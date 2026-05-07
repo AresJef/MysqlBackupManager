@@ -17,11 +17,57 @@ from uuid import uuid4
 from mysql_backup_manager.checksum import write_checksum_file
 from mysql_backup_manager.compression import gzip_file
 from mysql_backup_manager.config import DumpConfig, MySQLConnectionConfig, RestoreConfig, RetentionConfig
-from mysql_backup_manager.exceptions import MySQLBackupError, MySQLCommandError
+from mysql_backup_manager.exceptions import MySQLBackupError, MySQLClientNotFoundError, MySQLCommandError
 from mysql_backup_manager.logging import get_logger
 from mysql_backup_manager.models import BackupResult, RestoreResult, RetentionResult
-from mysql_backup_manager.process import build_env, run_command_to_file
+from mysql_backup_manager.process import build_env, run_command_capture, run_command_to_file
 from mysql_backup_manager.utils import elapsed_seconds, ensure_no_running_loop, utc_now
+
+
+def quote_mysql_string_literal(value: str) -> str:
+    """Quote a value as a MySQL string literal for preflight SQL.
+
+    :param value: Raw string value to quote.
+    :return: Single-quoted SQL string with quotes and backslashes escaped.
+
+    ## Example:
+    ```python
+    quote_mysql_string_literal("app's db")
+    # "'app''s db'"
+    ```
+    """
+
+    return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
+
+
+def dump_file_contains_database_objects(path: Path) -> bool:
+    """Return whether an uncompressed dump contains table/view definitions or rows.
+
+    :param path: Uncompressed SQL dump file to inspect.
+    :return: ``True`` when the dump includes common MySQL dump markers for table definitions, view definitions, or inserted row data.
+
+    ## Example:
+    ```python
+    # dump_file_contains_database_objects(Path("backup.sql"))
+    ```
+    """
+
+    markers = (
+        b"CREATE TABLE ",
+        b"CREATE TEMPORARY TABLE ",
+        b"CREATE VIEW ",
+        b"CREATE ALGORITHM",
+        b"INSERT INTO ",
+    )
+    overlap = max(len(marker) for marker in markers) - 1
+    previous = b""
+    with path.open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            window = previous + chunk.upper()
+            if any(marker in window for marker in markers):
+                return True
+            previous = window[-overlap:]
+    return False
 
 
 class BackupService:
@@ -123,6 +169,136 @@ class BackupService:
         command.append(database)
         return command
 
+    def build_database_exists_command(self, database: str) -> list[str]:
+        """Build a ``mysql`` preflight command that checks database visibility.
+
+        :param database: Database name to verify before running ``mysqldump``.
+        :return: Sanitized ``mysql`` command that prints ``1`` when the database exists and is visible, otherwise ``0``. Passwords are never included.
+
+        ## Example:
+        ```python
+        command = service.build_database_exists_command("app")
+        command[-1].startswith("--execute=SELECT EXISTS")
+        # True
+        ```
+        """
+
+        query = (
+            "SELECT EXISTS("
+            "SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA "
+            f"WHERE SCHEMA_NAME = {quote_mysql_string_literal(database)}"
+            ")"
+        )
+        command = [
+            self.config.mysql_path,
+            f"--host={self.connection.host}",
+            f"--port={self.connection.port}",
+            f"--user={self.connection.user}",
+            "--batch",
+            "--skip-column-names",
+        ]
+        if self.connection.socket:
+            command.append(f"--socket={self.connection.socket}")
+        if self.connection.default_character_set:
+            command.append(f"--default-character-set={self.connection.default_character_set}")
+        if self.connection.connect_timeout is not None:
+            command.append(f"--connect-timeout={self.connection.connect_timeout}")
+        command.append(f"--execute={query}")
+        return command
+
+    def _database_exists_timeout(self) -> float | None:
+        """Return the timeout used by the database-existence preflight.
+
+        :return: A bounded timeout in seconds when a connection timeout or command timeout is configured, otherwise ``None``.
+        """
+
+        if self.connection.connect_timeout is not None:
+            timeout = float(self.connection.connect_timeout + 5)
+            if self.config.command_timeout is not None:
+                return min(float(self.config.command_timeout), timeout)
+            return timeout
+        return self.config.command_timeout
+
+    async def database_exists(self, database: str) -> bool:
+        """Return whether ``database`` exists and is visible to the connection.
+
+        :param database: Database name to check through the native ``mysql`` client.
+        :return: ``True`` when ``INFORMATION_SCHEMA.SCHEMATA`` reports the database, otherwise ``False``.
+        :raises MySQLCommandError: If the ``mysql`` preflight command fails.
+        :raises MySQLBackupError: If the preflight returns an unexpected response.
+        """
+
+        stdout, _ = await run_command_capture(
+            self.build_database_exists_command(database),
+            env=build_env(self.connection.password_value()),
+            timeout=self._database_exists_timeout(),
+        )
+        answer = stdout.strip()
+        if answer == "1":
+            return True
+        if answer == "0":
+            return False
+        raise MySQLBackupError(
+            f"Unexpected database-existence check response for `{database}`: {answer!r}"
+        )
+
+    def build_database_object_count_command(self, database: str) -> list[str]:
+        """Build a ``mysql`` preflight command that counts visible tables/views.
+
+        :param database: Database name whose visible tables and views should be counted.
+        :return: Sanitized ``mysql`` command that prints the number of visible ``INFORMATION_SCHEMA.TABLES`` rows for the database. Passwords are never included.
+
+        ## Example:
+        ```python
+        command = service.build_database_object_count_command("app")
+        command[-1].startswith("--execute=SELECT COUNT")
+        # True
+        ```
+        """
+
+        query = (
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+            f"WHERE TABLE_SCHEMA = {quote_mysql_string_literal(database)}"
+        )
+        command = [
+            self.config.mysql_path,
+            f"--host={self.connection.host}",
+            f"--port={self.connection.port}",
+            f"--user={self.connection.user}",
+            "--batch",
+            "--skip-column-names",
+        ]
+        if self.connection.socket:
+            command.append(f"--socket={self.connection.socket}")
+        if self.connection.default_character_set:
+            command.append(f"--default-character-set={self.connection.default_character_set}")
+        if self.connection.connect_timeout is not None:
+            command.append(f"--connect-timeout={self.connection.connect_timeout}")
+        command.append(f"--execute={query}")
+        return command
+
+    async def visible_object_count(self, database: str) -> int:
+        """Return how many tables or views are visible to the connection.
+
+        :param database: Database name to inspect through ``INFORMATION_SCHEMA.TABLES``.
+        :return: Number of visible tables and views for the configured user.
+        :raises MySQLCommandError: If the ``mysql`` preflight command fails.
+        :raises MySQLBackupError: If the preflight returns a non-integer response.
+        """
+
+        stdout, _ = await run_command_capture(
+            self.build_database_object_count_command(database),
+            env=build_env(self.connection.password_value()),
+            timeout=self._database_exists_timeout(),
+        )
+        answer = stdout.strip()
+        try:
+            return int(answer)
+        except ValueError as exc:
+            raise MySQLBackupError(
+                f"Unexpected visible-object count response for `{database}`: {answer!r}"
+            ) from exc
+
     def build_output_path(self, database: str, *, now: datetime | None = None) -> Path:
         """Return the final uncompressed ``.sql`` path for a backup.
 
@@ -166,6 +342,8 @@ class BackupService:
         database = database.strip()
         if not database:
             raise MySQLBackupError("database must not be empty")
+        if "\x00" in database:
+            raise MySQLBackupError("database must not contain null bytes")
 
         started_at = utc_now()
         output_file = self.build_output_path(database, now=started_at)
@@ -177,6 +355,7 @@ class BackupService:
         stderr: str | None = None
         error: str | None = None
         success = False
+        visible_objects: int | None = None
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         expected_final_file = output_file.with_suffix(output_file.suffix + ".gz") if self.config.compress else output_file
@@ -204,6 +383,20 @@ class BackupService:
             )
 
         try:
+            if self.config.validate_database_exists:
+                self.logger.info("Validating database `%s` exists before backup", database)
+                if not await self.database_exists(database):
+                    raise MySQLBackupError(
+                        f"Database `{database}` does not exist or is not visible to user `{self.connection.user}`"
+                    )
+            if self.config.validate_database_has_objects or self.config.validate_dump_content:
+                visible_objects = await self.visible_object_count(database)
+            if self.config.validate_database_has_objects and visible_objects == 0:
+                raise MySQLBackupError(
+                    f"Database `{database}` has no visible tables or views for user `{self.connection.user}`; "
+                    "verify backup grants or set validate_database_has_objects=False for an intentionally empty database"
+                )
+
             self.logger.info("Starting backup for database `%s`", database)
             stderr = await run_command_to_file(
                 command,
@@ -211,6 +404,18 @@ class BackupService:
                 env=build_env(self.connection.password_value()),
                 timeout=self.config.command_timeout,
             )
+            if (
+                self.config.validate_dump_content
+                and visible_objects is not None
+                and visible_objects > 0
+                and not await asyncio.to_thread(
+                    dump_file_contains_database_objects, temp_output_file
+                )
+            ):
+                raise MySQLBackupError(
+                    f"mysqldump for database `{database}` completed but produced no table definitions or row data; "
+                    "verify mysqldump options and backup user privileges"
+                )
             temp_output_file.replace(output_file)
             final_file = output_file
             if self.config.compress:
@@ -233,6 +438,9 @@ class BackupService:
                 error,
                 f"; stderr: {stderr.strip()}" if stderr and stderr.strip() else "",
             )
+        except (MySQLBackupError, MySQLClientNotFoundError) as exc:
+            error = str(exc)
+            self.logger.error("Backup failed for database `%s`: %s", database, error)
         except Exception as exc:
             error = str(exc)
             self.logger.exception("Backup failed for database `%s`", database)

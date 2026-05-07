@@ -17,7 +17,14 @@ async def test_backup_uses_temp_file_and_cleans_on_failure(monkeypatch: pytest.M
     monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="root"),
-        DumpConfig(databases=["app"], output_dir=tmp_path, command_timeout=12),
+        DumpConfig(
+            databases=["app"],
+            output_dir=tmp_path,
+            command_timeout=12,
+            validate_database_exists=False,
+            validate_database_has_objects=False,
+            validate_dump_content=False,
+        ),
     )
 
     result = await service.backup_database("app")
@@ -34,20 +41,28 @@ async def test_backup_passes_command_timeout(monkeypatch: pytest.MonkeyPatch, tm
     async def fake_run(command, output_file, **kwargs):
         nonlocal seen_timeout
         seen_timeout = kwargs["timeout"]
-        output_file.write_text("dump", encoding="utf-8")
+        output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
         return ""
 
     monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="root"),
-        DumpConfig(databases=["app"], output_dir=tmp_path, command_timeout=12, generate_checksum=False),
+        DumpConfig(
+            databases=["app"],
+            output_dir=tmp_path,
+            command_timeout=12,
+            generate_checksum=False,
+            validate_database_exists=False,
+            validate_database_has_objects=False,
+            validate_dump_content=False,
+        ),
     )
 
     result = await service.backup_database("app")
 
     assert result.success is True
     assert seen_timeout == 12
-    assert result.output_file.read_text(encoding="utf-8") == "dump"
+    assert "CREATE TABLE" in result.output_file.read_text(encoding="utf-8")
 
 
 async def test_compressed_backup_respects_overwrite_false(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -82,7 +97,13 @@ async def test_manager_sync_api_rejects_running_event_loop(tmp_path: Path) -> No
 
     manager = MySQLBackupManager(
         MySQLConnectionConfig(user="root"),
-        DumpConfig(databases=["app"], output_dir=tmp_path),
+        DumpConfig(
+            databases=["app"],
+            output_dir=tmp_path,
+            validate_database_exists=False,
+            validate_database_has_objects=False,
+            validate_dump_content=False,
+        ),
     )
 
     with pytest.raises(RuntimeError, match="Sync APIs cannot be called"):
@@ -141,3 +162,111 @@ async def test_compressed_backup_respects_existing_uncompressed_output(monkeypat
     assert result.compressed_file is None
     assert "already exists" in (result.error or "")
     assert existing.read_text(encoding="utf-8") == "existing"
+
+
+async def test_backup_fails_before_dump_when_database_is_not_visible(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def fake_database_exists(database: str) -> bool:
+        assert database == "missing"
+        return False
+
+    async def fake_run(command, output_file, **kwargs):
+        raise AssertionError("mysqldump should not run when preflight fails")
+
+    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    service = BackupService(
+        MySQLConnectionConfig(user="root"),
+        DumpConfig(databases=["missing"], output_dir=tmp_path),
+    )
+    monkeypatch.setattr(service, "database_exists", fake_database_exists)
+
+    result = await service.backup_database("missing")
+
+    assert result.success is False
+    assert "does not exist or is not visible" in (result.error or "")
+    assert not list(tmp_path.iterdir())
+
+
+async def test_backup_uses_database_existence_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen_database = None
+
+    async def fake_database_exists(database: str) -> bool:
+        nonlocal seen_database
+        seen_database = database
+        return True
+
+    async def fake_visible_object_count(database: str) -> int:
+        assert database == "app"
+        return 1
+
+    async def fake_run(command, output_file, **kwargs):
+        output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
+        return ""
+
+    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    service = BackupService(
+        MySQLConnectionConfig(user="root"),
+        DumpConfig(databases=["app"], output_dir=tmp_path, generate_checksum=False),
+    )
+    monkeypatch.setattr(service, "database_exists", fake_database_exists)
+    monkeypatch.setattr(service, "visible_object_count", fake_visible_object_count)
+
+    result = await service.backup_database("app")
+
+    assert result.success is True
+    assert seen_database == "app"
+
+
+async def test_backup_fails_before_dump_when_no_tables_or_views_are_visible(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def fake_database_exists(database: str) -> bool:
+        assert database == "app"
+        return True
+
+    async def fake_visible_object_count(database: str) -> int:
+        assert database == "app"
+        return 0
+
+    async def fake_run(command, output_file, **kwargs):
+        raise AssertionError("mysqldump should not run when no objects are visible")
+
+    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    service = BackupService(
+        MySQLConnectionConfig(user="mysql_backup"),
+        DumpConfig(databases=["app"], output_dir=tmp_path),
+    )
+    monkeypatch.setattr(service, "database_exists", fake_database_exists)
+    monkeypatch.setattr(service, "visible_object_count", fake_visible_object_count)
+
+    result = await service.backup_database("app")
+
+    assert result.success is False
+    assert "has no visible tables or views" in (result.error or "")
+    assert "mysql_backup" in (result.error or "")
+    assert not list(tmp_path.iterdir())
+
+
+async def test_backup_fails_when_dump_contains_no_table_or_row_markers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def fake_database_exists(database: str) -> bool:
+        assert database == "app"
+        return True
+
+    async def fake_visible_object_count(database: str) -> int:
+        assert database == "app"
+        return 20
+
+    async def fake_run(command, output_file, **kwargs):
+        output_file.write_text("-- MySQL dump header only\n", encoding="utf-8")
+        return ""
+
+    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    service = BackupService(
+        MySQLConnectionConfig(user="mysql_backup"),
+        DumpConfig(databases=["app"], output_dir=tmp_path),
+    )
+    monkeypatch.setattr(service, "database_exists", fake_database_exists)
+    monkeypatch.setattr(service, "visible_object_count", fake_visible_object_count)
+
+    result = await service.backup_database("app")
+
+    assert result.success is False
+    assert "produced no table definitions or row data" in (result.error or "")
+    assert not list(tmp_path.iterdir())

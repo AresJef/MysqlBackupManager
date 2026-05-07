@@ -78,6 +78,7 @@ def _build_replica_backup_manager(
     user: str,
     password: str,
     command_timeout: int,
+    mysql_path: str = "mysql",
     retention: RetentionConfig | None = None,
 ) -> MySQLBackupManager:
     """Build a manager configured for large replica bootstrap backups.
@@ -89,6 +90,7 @@ def _build_replica_backup_manager(
     :param user: Source MySQL user.
     :param password: Source MySQL password.
     :param command_timeout: Maximum dump runtime in seconds.
+    :param mysql_path: Path or executable name for ``mysql`` used by backup database-existence preflight validation.
     :param retention: Optional retention policy for scheduled backup use.
     :return: ``MySQLBackupManager`` configured with gzip compression, SHA-256 checksum generation, ``--databases``, ``--quick``, ``--hex-blob``, and ``--set-gtid-purged=ON``.
     """
@@ -108,6 +110,9 @@ def _build_replica_backup_manager(
             compress=True,
             generate_checksum=True,
             checksum_algorithm="sha256",
+            mysql_path=mysql_path,
+            validate_database_has_objects=True,
+            validate_dump_content=True,
             set_gtid_purged="ON",
             single_transaction=True,
             lock_tables=False,
@@ -132,6 +137,7 @@ def scheduled_backup(
     user: str,
     password: str,
     command_timeout: int = 3600,
+    mysql_path: str = "mysql",
     interval_seconds: int | None = None,
     cron: str | None = None,
     timezone: str = "UTC",
@@ -149,6 +155,7 @@ def scheduled_backup(
     :param user: Source MySQL user.
     :param password: Source MySQL password.
     :param command_timeout: Maximum runtime in seconds for each dump command.
+    :param mysql_path: Path or executable name for ``mysql`` used by backup database-existence preflight validation.
     :param interval_seconds: Fixed interval between runs. Mutually exclusive with ``cron``.
     :param cron: Cron expression such as ``"0 3 * * *"``. Mutually exclusive with ``interval_seconds``.
     :param timezone: IANA timezone used for cron evaluation.
@@ -180,6 +187,7 @@ def scheduled_backup(
         user=user,
         password=password,
         command_timeout=command_timeout,
+        mysql_path=mysql_path,
         retention=RetentionConfig(
             enabled=True,
             keep_last=keep_last,
@@ -211,6 +219,7 @@ def backup(
     user: str,
     password: str,
     command_timeout: int = 3600,
+    mysql_path: str = "mysql",
 ) -> Path:
     """Create one compressed, checksummed, GTID-preserving backup.
 
@@ -221,6 +230,7 @@ def backup(
     :param user: Source MySQL user.
     :param password: Source MySQL password.
     :param command_timeout: Maximum dump runtime in seconds.
+    :param mysql_path: Path or executable name for ``mysql`` used by backup database-existence preflight validation.
     :return: Path to the final backup artifact, normally ``.sql.gz``.
     :raises RuntimeError: If the backup fails or no output file is returned.
 
@@ -245,6 +255,7 @@ def backup(
         user=user,
         password=password,
         command_timeout=command_timeout,
+        mysql_path=mysql_path,
     )
 
     result = manager.backup_database_sync(database)
@@ -268,6 +279,7 @@ def restore(
     user: str,
     password: str,
     command_timeout: int = 3600,
+    mysql_path: str = "mysql",
 ) -> None:
     """Restore a GTID-preserving backup for replica bootstrap.
 
@@ -278,6 +290,7 @@ def restore(
     :param user: Replica MySQL user.
     :param password: Replica MySQL password.
     :param command_timeout: Maximum restore runtime in seconds.
+    :param mysql_path: Path or executable name for ``mysql`` used by restore.
     :return: None when restore completes successfully.
     :raises RuntimeError: If checksum verification fails or restore returns ``success=False``.
 
@@ -316,6 +329,7 @@ def restore(
         RestoreConfig(
             database=None,
             input_file=backup_file,
+            mysql_path=mysql_path,
             strip_gtid_purged=False,
             decompress=True,
             force=False,

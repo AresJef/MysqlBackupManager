@@ -43,7 +43,7 @@ mysqldump --version
 mysql --version
 ```
 
-If they are not on `PATH`, pass custom executable paths with `DumpConfig.mysqldump_path` and `RestoreConfig.mysql_path`.
+If they are not on `PATH`, pass custom executable paths with `DumpConfig.mysqldump_path`, `DumpConfig.mysql_path`, and `RestoreConfig.mysql_path`. The backup path uses `mysql` for the default database-existence preflight check before running `mysqldump`.
 
 Paths such as `Path("~/Downloads/backups")` are expanded with `Path.expanduser()`.
 
@@ -251,6 +251,8 @@ backup_config = DumpConfig(
     output_dir=Path("./backups"),
     filename_template="{database}_{timestamp}.sql",
     timestamp_format="%Y%m%d_%H%M%S",
+    mysql_path="mysql",
+    validate_database_exists=True,
     single_transaction=True,
     routines=True,
     triggers=True,
@@ -295,6 +297,26 @@ DumpConfig(
 ```
 
 For safety, the rendered filename must be a plain filename. It cannot include path traversal such as `../backup.sql`.
+
+
+### Database Existence Preflight
+
+By default, backups first run small `mysql` queries against `INFORMATION_SCHEMA` to verify that the requested database exists and that at least one table or view is visible to the configured user. After `mysqldump` completes, the raw SQL is also checked for table/view definitions or inserted row data before it is moved, compressed, or checksummed. This prevents typos such as `amazon_x`, catches grant mistakes where the user can see the schema but cannot see/dump its tables, and rejects misleading header-only dump files.
+
+If the database is missing, not visible, has no visible tables/views, or produces a header-only dump while visible objects exist, `BackupResult.success` is `False` and no final backup file is written. The helper `backup()` function raises `RuntimeError` in that case.
+
+```python
+DumpConfig(
+    databases=["app"],
+    output_dir=Path("./backups"),
+    validate_database_exists=True,
+    validate_database_has_objects=True,
+    validate_dump_content=True,
+    mysql_path="mysql",
+)
+```
+
+Set `validate_database_exists=False`, `validate_database_has_objects=False`, or `validate_dump_content=False` only if you deliberately want to skip those checks, for example when backing up an intentionally empty database or using unusual `mysqldump` options that produce nonstandard SQL output.
 
 ### Compression
 
@@ -629,6 +651,7 @@ backup_file = backup(
     user="backup_user",
     password="secret",
     command_timeout=7200,
+    mysql_path="mysql",
 )
 
 verify_checksum(backup_file)
@@ -641,6 +664,7 @@ restore(
     user="restore_user",
     password="secret",
     command_timeout=7200,
+    mysql_path="mysql",
 )
 ```
 
@@ -664,7 +688,7 @@ scheduled_backup(
 )
 ```
 
-The helper backup uses gzip compression, SHA-256 checksums, `--databases`, `--quick`, `--hex-blob`, and `--set-gtid-purged=ON`. The helper restore verifies the adjacent `.sha256` file first and restores with `database=None`, so the dump should contain its own `CREATE DATABASE`/`USE` statements. For custom behavior, use `MySQLBackupManager`, `DumpConfig`, and `RestoreConfig` directly.
+The helper backup uses gzip compression, SHA-256 checksums, database/table-visibility preflight validation, post-dump content validation, `--databases`, `--quick`, `--hex-blob`, and `--set-gtid-purged=ON`. The helper restore verifies the adjacent `.sha256` file first and restores with `database=None`, so the dump should contain its own `CREATE DATABASE`/`USE` statements. For custom behavior, use `MySQLBackupManager`, `DumpConfig`, and `RestoreConfig` directly.
 
 ## Configuration Reference
 
@@ -689,7 +713,11 @@ The helper backup uses gzip compression, SHA-256 checksums, `--databases`, `--qu
 | `filename_template` | `"{database}_{timestamp}.sql"` | Output filename template. |
 | `timestamp_format` | `"%Y%m%d_%H%M%S"` | `datetime.strftime` format. |
 | `mysqldump_path` | `"mysqldump"` | Path or executable name for `mysqldump`. |
+| `mysql_path` | `"mysql"` | Path or executable name for `mysql`, used by backup database-existence preflight validation. |
 | `command_timeout` | `None` | Optional subprocess timeout in seconds. |
+| `validate_database_exists` | `True` | Verify that the requested database exists and is visible before running `mysqldump`. |
+| `validate_database_has_objects` | `True` | Verify that at least one table or view is visible before running `mysqldump`. Disable for intentionally empty databases. |
+| `validate_dump_content` | `True` | Verify that a dump with visible objects contains table/view definitions or row data before finalizing the backup artifact. |
 | `single_transaction` | `True` | Add `--single-transaction`. |
 | `routines` | `True` | Add `--routines`. |
 | `triggers` | `True` | Add `--triggers`. |
@@ -858,7 +886,7 @@ The unit tests do not require a real MySQL server. They focus on configuration v
 
 ## Limitations
 
-- A real backup requires `mysqldump` installed on the host.
+- A real backup requires `mysqldump` installed on the host. With the default `validate_database_exists=True`, backup also requires the `mysql` client for preflight validation.
 - A real restore requires `mysql` installed on the host.
 - Gzip is the only compression format currently supported.
 - Command timeouts are opt-in; set `command_timeout` for strict runtime limits.
