@@ -46,13 +46,19 @@ async def _stop_process(process: asyncio.subprocess.Process, *tasks: asyncio.Tas
 
     :param process: Subprocess returned by ``asyncio.create_subprocess_exec``.
     :param tasks: Helper tasks that should be cancelled after the process is stopped.
-    :return: None. The process is waited on and tasks are gathered with exceptions captured.
+    :return: None. The process is first asked to terminate gracefully, then killed if it does not exit quickly. Helper tasks are cancelled and gathered with exceptions captured.
     """
 
     if process.returncode is None:
-        process.kill()
-    with suppress(Exception):
-        await process.wait()
+        with suppress(ProcessLookupError):
+            process.terminate()
+        with suppress(Exception):
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+    if process.returncode is None:
+        with suppress(ProcessLookupError):
+            process.kill()
+        with suppress(Exception):
+            await process.wait()
     for task in tasks:
         if not task.done():
             task.cancel()
@@ -137,7 +143,7 @@ async def run_command_capture(
     except TimeoutError as exc:
         await _stop_process(process)
         raise MySQLCommandError("Command timed out", stderr=None) from exc
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         await _stop_process(process)
         raise
 
@@ -207,7 +213,7 @@ async def run_command_to_file(
     except TimeoutError as exc:
         await _stop_process(process, copy_task, stderr_task)
         raise MySQLCommandError("Command timed out", stderr=None) from exc
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         await _stop_process(process, copy_task, stderr_task)
         raise
     except Exception:
@@ -291,7 +297,7 @@ async def run_command_with_input(
             returncode=process.returncode,
             stderr=stderr,
         ) from exc
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         await _stop_process(process, feed_task, stderr_task)
         raise
     except Exception:

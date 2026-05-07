@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -68,6 +69,85 @@ def dump_file_contains_database_objects(path: Path) -> bool:
                 return True
             previous = window[-overlap:]
     return False
+
+
+def is_backup_temp_file(path: Path) -> bool:
+    """Return whether ``path`` looks like a library-created backup temp file.
+
+    :param path: Candidate path inside a backup output directory.
+    :return: ``True`` for hidden ``.part`` files whose name matches the library temp-file shape ``.<sql-name>.<uuid>.part``; otherwise ``False``. Symlinks are never treated as backup temp files.
+
+    ## Example:
+    ```python
+    is_backup_temp_file(Path(".app_20260101.sql.0123456789abcdef0123456789abcdef.part"))
+    # True
+    ```
+    """
+
+    if path.is_symlink():
+        return False
+    name = path.name
+    if not name.startswith(".") or not name.endswith(".part"):
+        return False
+    parts = name.split(".")
+    if len(parts) < 5 or "sql" not in parts[1:-2]:
+        return False
+    uuid_token = parts[-2]
+    return len(uuid_token) == 32 and all(
+        character in "0123456789abcdef" for character in uuid_token.lower()
+    )
+
+
+def cleanup_stale_backup_temp_files(
+    output_dir: Path,
+    *,
+    older_than_seconds: float | None,
+    logger: logging.Logger | None = None,
+) -> list[Path]:
+    """Remove stale hidden ``.part`` backup files from ``output_dir``.
+
+    :param output_dir: Backup directory to inspect. Only direct child files are considered.
+    :param older_than_seconds: Minimum file age in seconds before deletion. Pass ``0`` to delete matching files immediately, or ``None`` to disable deletion.
+    :param logger: Optional logger used to report deleted temp files.
+    :return: List of temp files that were removed.
+    :raises OSError: If the directory cannot be scanned or a matching file cannot be deleted.
+
+    ## Example:
+    ```python
+    deleted = cleanup_stale_backup_temp_files(Path("./backups"), older_than_seconds=86400)
+    ```
+    """
+
+    if older_than_seconds is None:
+        return []
+
+    directory = Path(output_dir).expanduser()
+    if not directory.exists():
+        return []
+
+    deleted_files: list[Path] = []
+    now = time.time()
+    for path in directory.iterdir():
+        if not is_backup_temp_file(path) or not path.is_file():
+            continue
+        age_seconds = now - path.stat().st_mtime
+        if age_seconds < older_than_seconds:
+            continue
+        path.unlink()
+        deleted_files.append(path)
+        if logger is not None:
+            logger.info("Removed stale backup temp file: %s", path)
+    return deleted_files
+
+
+def _new_backup_temp_file(final_path: Path) -> Path:
+    """Return a unique hidden temp path next to ``final_path``.
+
+    :param final_path: Intended final backup artifact path.
+    :return: Hidden ``.part`` path in the same directory, suitable for atomic replacement of ``final_path``.
+    """
+
+    return final_path.with_name(f".{final_path.name}.{uuid4().hex}.part")
 
 
 class BackupService:
@@ -347,7 +427,7 @@ class BackupService:
 
         started_at = utc_now()
         output_file = self.build_output_path(database, now=started_at)
-        temp_output_file = output_file.with_name(f".{output_file.name}.{uuid4().hex}.part")
+        temp_output_file = _new_backup_temp_file(output_file)
         command = self.build_command(database)
         compressed_file: Path | None = None
         checksum_file: Path | None = None
@@ -358,6 +438,15 @@ class BackupService:
         visible_objects: int | None = None
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.config.cleanup_stale_temp_files:
+            try:
+                cleanup_stale_backup_temp_files(
+                    self.config.output_dir,
+                    older_than_seconds=self.config.stale_temp_file_age_seconds,
+                    logger=self.logger,
+                )
+            except OSError as exc:
+                self.logger.warning("Failed to remove stale backup temp files: %s", exc)
         expected_final_file = output_file.with_suffix(output_file.suffix + ".gz") if self.config.compress else output_file
         collision_candidates = [expected_final_file]
         if self.config.compress:
@@ -429,6 +518,9 @@ class BackupService:
                 )
             success = True
             self.logger.info("Backup succeeded for database `%s`: %s", database, final_file)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            self.logger.warning("Backup interrupted for database `%s`; cleaning up temporary files", database)
+            raise
         except MySQLCommandError as exc:
             stderr = exc.stderr
             error = str(exc)

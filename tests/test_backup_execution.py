@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import time
 from pathlib import Path
 
 import pytest
 
-from mysql_backup_manager.backup import BackupService
+from mysql_backup_manager.backup import BackupService, cleanup_stale_backup_temp_files, is_backup_temp_file
 from mysql_backup_manager.config import DumpConfig, MySQLConnectionConfig
 from mysql_backup_manager.exceptions import MySQLCommandError
 
@@ -270,3 +273,107 @@ async def test_backup_fails_when_dump_contains_no_table_or_row_markers(monkeypat
     assert result.success is False
     assert "produced no table definitions or row data" in (result.error or "")
     assert not list(tmp_path.iterdir())
+
+
+async def test_backup_cancellation_removes_current_temp_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def fake_run(command, output_file, **kwargs):
+        output_file.write_text("partial", encoding="utf-8")
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    service = BackupService(
+        MySQLConnectionConfig(user="root"),
+        DumpConfig(
+            databases=["app"],
+            output_dir=tmp_path,
+            validate_database_exists=False,
+            validate_database_has_objects=False,
+            validate_dump_content=False,
+        ),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.backup_database("app")
+
+    assert not list(tmp_path.iterdir())
+
+
+def test_cleanup_stale_backup_temp_files_deletes_only_old_hidden_part_files(tmp_path: Path) -> None:
+    old_temp = tmp_path / ".app_20260101.sql.0123456789abcdef0123456789abcdef.part"
+    young_temp = tmp_path / ".app_20260102.sql.fedcba9876543210fedcba9876543210.part"
+    visible_part = tmp_path / "app_20260103.sql.part"
+    unrelated = tmp_path / ".not-a-sql-temp.part"
+    for path in (old_temp, young_temp, visible_part, unrelated):
+        path.write_text("partial", encoding="utf-8")
+
+    old_timestamp = time.time() - 120
+    os.utime(old_temp, (old_timestamp, old_timestamp))
+
+    assert is_backup_temp_file(old_temp) is True
+    assert is_backup_temp_file(visible_part) is False
+
+    deleted = cleanup_stale_backup_temp_files(tmp_path, older_than_seconds=60)
+
+    assert deleted == [old_temp]
+    assert not old_temp.exists()
+    assert young_temp.exists()
+    assert visible_part.exists()
+    assert unrelated.exists()
+
+
+async def test_backup_cleans_stale_temp_files_before_dump(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    stale_temp = tmp_path / ".app_20260101.sql.0123456789abcdef0123456789abcdef.part"
+    stale_temp.write_text("partial", encoding="utf-8")
+    old_timestamp = time.time() - 120
+    os.utime(stale_temp, (old_timestamp, old_timestamp))
+
+    async def fake_run(command, output_file, **kwargs):
+        assert not stale_temp.exists()
+        output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
+        return ""
+
+    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    service = BackupService(
+        MySQLConnectionConfig(user="root"),
+        DumpConfig(
+            databases=["app"],
+            output_dir=tmp_path,
+            generate_checksum=False,
+            validate_database_exists=False,
+            validate_database_has_objects=False,
+            validate_dump_content=False,
+            stale_temp_file_age_seconds=60,
+        ),
+    )
+
+    result = await service.backup_database("app")
+
+    assert result.success is True
+    assert not stale_temp.exists()
+
+
+async def test_backup_continues_when_stale_temp_cleanup_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def fake_run(command, output_file, **kwargs):
+        output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
+        return ""
+
+    def fake_cleanup(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr("mysql_backup_manager.backup.cleanup_stale_backup_temp_files", fake_cleanup)
+    service = BackupService(
+        MySQLConnectionConfig(user="root"),
+        DumpConfig(
+            databases=["app"],
+            output_dir=tmp_path,
+            generate_checksum=False,
+            validate_database_exists=False,
+            validate_database_has_objects=False,
+            validate_dump_content=False,
+        ),
+    )
+
+    result = await service.backup_database("app")
+
+    assert result.success is True

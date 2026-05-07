@@ -97,14 +97,26 @@ def test_config_normalizes_connection_and_database_names(tmp_path: Path) -> None
     assert restore.database == "app"
 
 
-def test_extra_options_reject_password_arguments(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--password",
+        "--password=secret",
+        "--password secret",
+        "--password\tsecret",
+        "--password\nsecret",
+        "-p",
+        "-psecret",
+    ],
+)
+def test_extra_options_reject_password_arguments(tmp_path: Path, option: str) -> None:
     sql = tmp_path / "backup.sql"
     sql.write_text("select 1;", encoding="utf-8")
 
     with pytest.raises(ValueError):
-        DumpConfig(databases=["app"], output_dir=tmp_path, extra_options=["--password=secret"])
+        DumpConfig(databases=["app"], output_dir=tmp_path, extra_options=[option])
     with pytest.raises(ValueError):
-        RestoreConfig(input_file=sql, extra_options=["-psecret"])
+        RestoreConfig(input_file=sql, extra_options=[option])
 
 
 def test_retention_match_pattern_must_stay_inside_output_dir() -> None:
@@ -197,3 +209,24 @@ def test_executable_paths_are_stripped(tmp_path: Path) -> None:
     assert dump.validate_database_has_objects is True
     assert dump.validate_dump_content is True
     assert restore.mysql_path == "mysql"
+
+
+def test_dump_config_normalizes_and_validates_gtid_purged(tmp_path: Path) -> None:
+    config = DumpConfig(databases=["app"], output_dir=tmp_path, set_gtid_purged="auto")
+
+    assert config.set_gtid_purged == "AUTO"
+
+    with pytest.raises(BackupConfigError):
+        DumpConfig(databases=["app"], output_dir=tmp_path, set_gtid_purged="INVALID")
+
+
+def test_dump_config_can_disable_stale_temp_cleanup(tmp_path: Path) -> None:
+    config = DumpConfig(
+        databases=["app"],
+        output_dir=tmp_path,
+        cleanup_stale_temp_files=False,
+        stale_temp_file_age_seconds=None,
+    )
+
+    assert config.cleanup_stale_temp_files is False
+    assert config.stale_temp_file_age_seconds is None

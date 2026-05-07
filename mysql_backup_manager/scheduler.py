@@ -112,6 +112,9 @@ class SchedulerService:
                     len(results),
                 )
                 return True
+            except asyncio.CancelledError:
+                self.logger.info("Scheduled backup run cancelled")
+                raise
             except Exception as exc:
                 self.last_error = exc
                 self.logger.exception("Scheduled backup run failed")
@@ -179,12 +182,16 @@ class SchedulerService:
         if not self.config.enabled:
             self.logger.info("Scheduler is disabled")
             return
-        if self.config.run_immediately:
-            succeeded = await self.run_once()
-            if stop_on_failure and not succeeded:
-                raise SchedulerError(self._last_failure_message())
-        while True:
-            await asyncio.sleep(self._next_sleep_seconds())
-            succeeded = await self.run_once()
-            if stop_on_failure and not succeeded:
-                raise SchedulerError(self._last_failure_message())
+        try:
+            if self.config.run_immediately:
+                succeeded = await self.run_once()
+                if stop_on_failure and not succeeded:
+                    raise SchedulerError(self._last_failure_message())
+            while True:
+                await asyncio.sleep(self._next_sleep_seconds())
+                succeeded = await self.run_once()
+                if stop_on_failure and not succeeded:
+                    raise SchedulerError(self._last_failure_message())
+        except asyncio.CancelledError:
+            self.logger.info("Scheduler cancelled; exiting")
+            raise

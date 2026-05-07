@@ -8,6 +8,7 @@ for non-replication restores.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import BinaryIO
 
@@ -309,6 +310,9 @@ class RestoreService:
                 )
             success = True
             self.logger.info("Restore succeeded from %s", self.config.input_file)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            self.logger.warning("Restore interrupted from %s; stopping mysql process", self.config.input_file)
+            raise
         except MySQLCommandError as exc:
             stderr = exc.stderr
             error = str(exc)

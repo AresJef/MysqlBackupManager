@@ -21,12 +21,15 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 from mysql_backup_manager.exceptions import BackupConfigError, RestoreConfigError
 
 
+GtidPurgedMode = Literal["AUTO", "ON", "OFF"]
+
+
 def _reject_password_options(options: list[str]) -> list[str]:
     """Reject raw MySQL password options in user-supplied CLI arguments.
 
     :param options: Raw option strings supplied through ``DumpConfig.extra_options`` or ``RestoreConfig.extra_options``.
     :return: Stripped option strings when no password-bearing option is present.
-    :raises ValueError: If an option is blank, contains a null byte, or tries to pass a password with ``--password``, ``--password=...``, ``-p``, or ``-psecret``.
+    :raises ValueError: If an option is blank, contains a null byte, or tries to pass a password with ``--password``, ``--password=...``, ``--password secret``, ``-p``, or ``-psecret``.
 
     ## Example:
     ```python
@@ -42,9 +45,15 @@ def _reject_password_options(options: list[str]) -> list[str]:
             raise ValueError("extra_options entries must not be empty")
         if "\x00" in normalized:
             raise ValueError("extra_options entries must not contain null bytes")
+        has_spaced_long_password = (
+            normalized.startswith("--password")
+            and len(normalized) > len("--password")
+            and normalized[len("--password")].isspace()
+        )
         has_password_option = (
             normalized == "--password"
             or normalized.startswith("--password=")
+            or has_spaced_long_password
             or normalized == "-p"
             or normalized.startswith("-p")
         )
@@ -167,6 +176,8 @@ class DumpConfig(BaseModel):
     :param validate_database_exists: Check that the database exists and is visible to the configured user before running ``mysqldump``.
     :param validate_database_has_objects: Check that at least one table or view is visible before running ``mysqldump``. Disable this only when backing up intentionally empty databases.
     :param validate_dump_content: Check that the produced SQL contains table/view definitions or row data when visible objects exist.
+    :param cleanup_stale_temp_files: Remove old hidden ``.part`` files from interrupted backup attempts before starting a new backup.
+    :param stale_temp_file_age_seconds: Minimum age in seconds before stale temp files are removed. Defaults to one day to avoid touching active backups from another process.
     :param single_transaction: Add ``--single-transaction`` for consistent InnoDB dumps.
     :param routines: Include stored routines.
     :param triggers: Include triggers.
@@ -177,7 +188,7 @@ class DumpConfig(BaseModel):
     :param lock_tables: Add ``--lock-tables`` when true; otherwise add ``--skip-lock-tables``.
     :param flush_logs: Add ``--flush-logs``.
     :param master_data: Optional ``--master-data`` value for replication workflows.
-    :param set_gtid_purged: Optional ``--set-gtid-purged`` value such as ``"ON"`` or ``"OFF"``.
+    :param set_gtid_purged: Optional ``--set-gtid-purged`` value. Supported values are ``"AUTO"``, ``"ON"``, and ``"OFF"``.
     :param where: Optional ``--where`` clause for partial table dumps.
     :param ignore_tables: Tables to skip, each formatted as ``db.table``.
     :param extra_options: Additional raw mysqldump options appended before the database name. Password options are rejected.
@@ -209,6 +220,8 @@ class DumpConfig(BaseModel):
     validate_database_exists: bool = True
     validate_database_has_objects: bool = True
     validate_dump_content: bool = True
+    cleanup_stale_temp_files: bool = True
+    stale_temp_file_age_seconds: float | None = Field(default=24 * 60 * 60, ge=0)
     single_transaction: bool = True
     routines: bool = True
     triggers: bool = True
@@ -219,7 +232,7 @@ class DumpConfig(BaseModel):
     lock_tables: bool = False
     flush_logs: bool = False
     master_data: int | None = Field(default=None, ge=1, le=2)
-    set_gtid_purged: str | None = None
+    set_gtid_purged: GtidPurgedMode | None = None
     where: str | None = None
     ignore_tables: list[str] = Field(default_factory=list)
     extra_options: list[str] = Field(default_factory=list)
@@ -302,6 +315,29 @@ class DumpConfig(BaseModel):
         if "\x00" in stripped:
             raise BackupConfigError("native client executable paths must not contain null bytes")
         return stripped
+
+    @field_validator("set_gtid_purged", mode="before")
+    @classmethod
+    def set_gtid_purged_must_be_supported(cls, value: object) -> object:
+        """Normalize and validate ``--set-gtid-purged`` values.
+
+        :param value: Raw GTID purge mode supplied to ``DumpConfig.set_gtid_purged``.
+        :return: ``None`` or an uppercase value accepted by ``mysqldump``: ``"AUTO"``, ``"ON"``, or ``"OFF"``.
+        :raises BackupConfigError: If the value is blank, contains a null byte, or is not one of the supported modes.
+        """
+
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise BackupConfigError("set_gtid_purged must be one of: AUTO, ON, OFF")
+        normalized = value.strip().upper()
+        if not normalized:
+            raise BackupConfigError("set_gtid_purged must not be empty when provided")
+        if "\x00" in normalized:
+            raise BackupConfigError("set_gtid_purged must not contain null bytes")
+        if normalized not in {"AUTO", "ON", "OFF"}:
+            raise BackupConfigError("set_gtid_purged must be one of: AUTO, ON, OFF")
+        return normalized
 
     @field_validator("ignore_tables")
     @classmethod
