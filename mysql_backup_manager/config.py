@@ -168,6 +168,7 @@ class DumpConfig(BaseModel):
 
     :param databases: Non-empty list of database names that this config may back up.
     :param output_dir: Directory where backup files, compressed files, and checksum sidecars are written. ``~`` is expanded and the directory is created.
+    :param temp_dir: Optional directory for active backup ``.part`` files. When omitted, backups use ``MYSQL_BACKUP_MANAGER_TEMP_DIR`` or ``~/.MysqlBackupManager``. The directory is created only when a backup runs.
     :param filename_template: Template used for uncompressed SQL filenames. It must include ``{database}`` and ``{timestamp}`` and render to a plain filename.
     :param timestamp_format: ``datetime.strftime`` format used by ``filename_template``.
     :param mysqldump_path: Executable name or absolute path for ``mysqldump``.
@@ -212,6 +213,7 @@ class DumpConfig(BaseModel):
 
     databases: list[str]
     output_dir: Path
+    temp_dir: Path | None = None
     filename_template: str = "{database}_{timestamp}.sql"
     timestamp_format: str = "%Y%m%d_%H%M%S"
     mysqldump_path: str = "mysqldump"
@@ -271,6 +273,25 @@ class DumpConfig(BaseModel):
 
         expanded = value.expanduser()
         expanded.mkdir(parents=True, exist_ok=True)
+        return expanded
+
+    @field_validator("temp_dir")
+    @classmethod
+    def temp_dir_must_be_safe(cls, value: Path | None) -> Path | None:
+        """Expand and validate the optional backup temp directory.
+
+        :param value: Raw temp directory path, or ``None`` to use the runtime default.
+        :return: The expanded temp directory path, or ``None`` when the runtime default should be used.
+        :raises BackupConfigError: If the path contains a null byte or points at an existing non-directory path.
+        """
+
+        if value is None:
+            return None
+        if "\x00" in str(value):
+            raise BackupConfigError("temp_dir must not contain null bytes")
+        expanded = value.expanduser()
+        if expanded.exists() and not expanded.is_dir():
+            raise BackupConfigError("temp_dir must be a directory when it already exists")
         return expanded
 
     @field_validator("filename_template")

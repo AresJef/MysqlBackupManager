@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 from mysql_backup_manager.config import MySQLConnectionConfig, RestoreConfig
 from mysql_backup_manager.restore import RestoreService
+
+
+restore_module = importlib.import_module("mysql_backup_manager.restore")
 
 
 def test_mysql_restore_command_with_database_without_password(tmp_path: Path) -> None:
@@ -53,7 +57,7 @@ async def test_restore_passes_command_timeout(monkeypatch, tmp_path: Path) -> No
         assert input_stream.read() == b"select 1;"
         return ""
 
-    monkeypatch.setattr("mysql_backup_manager.restore.run_command_with_input", fake_run)
+    monkeypatch.setattr(restore_module, "run_command_with_input", fake_run)
     service = RestoreService(
         MySQLConnectionConfig(user="root"),
         RestoreConfig(input_file=sql, command_timeout=9),
@@ -107,7 +111,7 @@ async def test_restore_create_database_streams_prefixed_input(monkeypatch, tmp_p
         seen_payload = input_stream.read().decode("utf-8")
         return ""
 
-    monkeypatch.setattr("mysql_backup_manager.restore.run_command_with_input", fake_run)
+    monkeypatch.setattr(restore_module, "run_command_with_input", fake_run)
     service = RestoreService(
         MySQLConnectionConfig(user="root"),
         RestoreConfig(database="app_copy", input_file=sql, create_database_if_missing=True),

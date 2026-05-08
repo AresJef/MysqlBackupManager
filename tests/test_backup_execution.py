@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import importlib
 import os
 import time
 from pathlib import Path
@@ -12,12 +14,25 @@ from mysql_backup_manager.config import DumpConfig, MySQLConnectionConfig
 from mysql_backup_manager.exceptions import MySQLCommandError
 
 
+backup_module = importlib.import_module("mysql_backup_manager.backup")
+
+
+@pytest.fixture(autouse=True)
+def isolate_default_backup_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep default backup temp files out of the real home directory during tests."""
+
+    temp_dir = tmp_path_factory.mktemp("mysql-backup-manager-temp")
+    monkeypatch.setenv("MYSQL_BACKUP_MANAGER_TEMP_DIR", str(temp_dir))
+
+
 async def test_backup_uses_temp_file_and_cleans_on_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     async def fake_run(command, output_file, **kwargs):
         output_file.write_text("partial", encoding="utf-8")
         raise MySQLCommandError("boom", stderr="failed")
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="root"),
         DumpConfig(
@@ -47,7 +62,7 @@ async def test_backup_passes_command_timeout(monkeypatch: pytest.MonkeyPatch, tm
         output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
         return ""
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="root"),
         DumpConfig(
@@ -68,11 +83,128 @@ async def test_backup_passes_command_timeout(monkeypatch: pytest.MonkeyPatch, tm
     assert "CREATE TABLE" in result.output_file.read_text(encoding="utf-8")
 
 
+async def test_backup_stages_dump_in_configured_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "backups"
+    temp_dir = tmp_path / "manager-temp"
+    seen_output_file: Path | None = None
+
+    async def fake_run(command, output_file, **kwargs):
+        nonlocal seen_output_file
+        seen_output_file = output_file
+        assert output_file.parent == temp_dir
+        output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
+        return ""
+
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
+    service = BackupService(
+        MySQLConnectionConfig(user="root"),
+        DumpConfig(
+            databases=["app"],
+            output_dir=output_dir,
+            temp_dir=temp_dir,
+            generate_checksum=False,
+            validate_database_exists=False,
+            validate_database_has_objects=False,
+            validate_dump_content=False,
+        ),
+    )
+
+    result = await service.backup_database("app")
+
+    assert result.success is True
+    assert seen_output_file is not None
+    assert result.output_file.parent == output_dir
+    assert result.output_file.exists()
+    assert not list(output_dir.glob("*.part"))
+    assert not list(temp_dir.iterdir())
+
+
+async def test_compressed_backup_stages_dump_and_gzip_in_configured_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "backups"
+    temp_dir = tmp_path / "manager-temp"
+
+    async def fake_run(command, output_file, **kwargs):
+        assert output_file.parent == temp_dir
+        output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
+        return ""
+
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
+    service = BackupService(
+        MySQLConnectionConfig(user="root"),
+        DumpConfig(
+            databases=["app"],
+            output_dir=output_dir,
+            temp_dir=temp_dir,
+            filename_template="{database}_{timestamp}.sql",
+            timestamp_format="fixed",
+            compress=True,
+            generate_checksum=False,
+            validate_database_exists=False,
+            validate_database_has_objects=False,
+            validate_dump_content=False,
+        ),
+    )
+
+    result = await service.backup_database("app")
+
+    assert result.success is True
+    assert result.output_file == output_dir / "app_fixed.sql"
+    assert result.compressed_file == output_dir / "app_fixed.sql.gz"
+    assert not result.output_file.exists()
+    assert result.compressed_file.exists()
+    with gzip.open(result.compressed_file, "rt", encoding="utf-8") as file:
+        assert "CREATE TABLE" in file.read()
+    assert not list(output_dir.glob("*.part"))
+    assert not list(temp_dir.iterdir())
+
+
+async def test_backup_publishes_checksum_sidecar_from_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "backups"
+    temp_dir = tmp_path / "manager-temp"
+
+    async def fake_run(command, output_file, **kwargs):
+        assert output_file.parent == temp_dir
+        output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
+        return ""
+
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
+    service = BackupService(
+        MySQLConnectionConfig(user="root"),
+        DumpConfig(
+            databases=["app"],
+            output_dir=output_dir,
+            temp_dir=temp_dir,
+            filename_template="{database}_{timestamp}.sql",
+            timestamp_format="fixed",
+            generate_checksum=True,
+            validate_database_exists=False,
+            validate_database_has_objects=False,
+            validate_dump_content=False,
+        ),
+    )
+
+    result = await service.backup_database("app")
+
+    assert result.success is True
+    assert result.output_file == output_dir / "app_fixed.sql"
+    assert result.checksum_file == output_dir / "app_fixed.sql.sha256"
+    assert result.checksum_file.exists()
+    assert result.checksum_file.read_text(encoding="utf-8").endswith("  app_fixed.sql\n")
+    assert not list(output_dir.glob("*.part"))
+    assert not list(temp_dir.iterdir())
+
+
 async def test_compressed_backup_respects_overwrite_false(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     async def fake_run(command, output_file, **kwargs):
         raise AssertionError("mysqldump should not run when target exists")
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     existing = tmp_path / "app_fixed.sql.gz"
     existing.write_text("existing", encoding="utf-8")
     service = BackupService(
@@ -132,7 +264,6 @@ async def test_manager_backup_database_strips_input(monkeypatch: pytest.MonkeyPa
 
 
 def test_public_time_helpers_are_no_longer_exported_from_backup_module() -> None:
-    import mysql_backup_manager.backup as backup_module
     from mysql_backup_manager import utils
 
     assert backup_module.utc_now is utils.utc_now
@@ -143,7 +274,7 @@ async def test_compressed_backup_respects_existing_uncompressed_output(monkeypat
     async def fake_run(command, output_file, **kwargs):
         raise AssertionError("mysqldump should not run when uncompressed staging target exists")
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     existing = tmp_path / "app_fixed.sql"
     existing.write_text("existing", encoding="utf-8")
     service = BackupService(
@@ -175,7 +306,7 @@ async def test_backup_fails_before_dump_when_database_is_not_visible(monkeypatch
     async def fake_run(command, output_file, **kwargs):
         raise AssertionError("mysqldump should not run when preflight fails")
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="root"),
         DumpConfig(databases=["missing"], output_dir=tmp_path),
@@ -205,7 +336,7 @@ async def test_backup_uses_database_existence_preflight(monkeypatch: pytest.Monk
         output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
         return ""
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="root"),
         DumpConfig(databases=["app"], output_dir=tmp_path, generate_checksum=False),
@@ -231,7 +362,7 @@ async def test_backup_fails_before_dump_when_no_tables_or_views_are_visible(monk
     async def fake_run(command, output_file, **kwargs):
         raise AssertionError("mysqldump should not run when no objects are visible")
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="mysql_backup"),
         DumpConfig(databases=["app"], output_dir=tmp_path),
@@ -260,7 +391,7 @@ async def test_backup_fails_when_dump_contains_no_table_or_row_markers(monkeypat
         output_file.write_text("-- MySQL dump header only\n", encoding="utf-8")
         return ""
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="mysql_backup"),
         DumpConfig(databases=["app"], output_dir=tmp_path),
@@ -280,7 +411,7 @@ async def test_backup_cancellation_removes_current_temp_file(monkeypatch: pytest
         output_file.write_text("partial", encoding="utf-8")
         raise asyncio.CancelledError
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="root"),
         DumpConfig(
@@ -332,7 +463,7 @@ async def test_backup_cleans_stale_temp_files_before_dump(monkeypatch: pytest.Mo
         output_file.write_text("CREATE TABLE `app` (`id` int);", encoding="utf-8")
         return ""
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
     service = BackupService(
         MySQLConnectionConfig(user="root"),
         DumpConfig(
@@ -360,8 +491,8 @@ async def test_backup_continues_when_stale_temp_cleanup_fails(monkeypatch: pytes
     def fake_cleanup(*args, **kwargs):
         raise OSError("permission denied")
 
-    monkeypatch.setattr("mysql_backup_manager.backup.run_command_to_file", fake_run)
-    monkeypatch.setattr("mysql_backup_manager.backup.cleanup_stale_backup_temp_files", fake_cleanup)
+    monkeypatch.setattr(backup_module, "run_command_to_file", fake_run)
+    monkeypatch.setattr(backup_module, "cleanup_stale_backup_temp_files", fake_cleanup)
     service = BackupService(
         MySQLConnectionConfig(user="root"),
         DumpConfig(

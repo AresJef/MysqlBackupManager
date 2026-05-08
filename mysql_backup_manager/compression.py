@@ -14,6 +14,37 @@ from typing import BinaryIO
 from uuid import uuid4
 
 
+def gzip_file_to_path(path: Path, output_path: Path, *, remove_original: bool = True) -> Path:
+    """Compress ``path`` directly into ``output_path`` and return it.
+
+    :param path: Existing file to compress.
+    :param output_path: Destination file that receives gzip bytes. Callers normally pass a temporary ``.part`` path and publish it after this function returns.
+    :param remove_original: Delete ``path`` after the gzip file has been completely written.
+    :return: The ``output_path`` that now contains gzip-compressed data.
+    :raises FileNotFoundError: If ``path`` does not exist.
+    :raises OSError: If compression, destination writing, or deletion fails.
+
+    ## Example:
+    ```python
+    from pathlib import Path
+    path = Path("example.sql")
+    path.write_text("SELECT 1;", encoding="utf-8")
+    # 9
+    gz_path = gzip_file_to_path(path, Path("example.sql.gz.part"))
+    gz_path.exists()
+    # True
+    gz_path.unlink()
+    ```
+    """
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("rb") as source, gzip.open(output_path, "wb") as target:
+        shutil.copyfileobj(source, target)
+    if remove_original:
+        path.unlink()
+    return output_path
+
+
 def gzip_file(path: Path, *, remove_original: bool = True) -> Path:
     """Compress ``path`` to ``path`` plus ``.gz`` and return the gzip path.
 
@@ -39,8 +70,7 @@ def gzip_file(path: Path, *, remove_original: bool = True) -> Path:
     compressed_path = path.with_suffix(path.suffix + ".gz")
     temp_path = compressed_path.with_name(f".{compressed_path.name}.{uuid4().hex}.part")
     try:
-        with path.open("rb") as source, gzip.open(temp_path, "wb") as target:
-            shutil.copyfileobj(source, target)
+        gzip_file_to_path(path, temp_path, remove_original=False)
         temp_path.replace(compressed_path)
     finally:
         temp_path.unlink(missing_ok=True)

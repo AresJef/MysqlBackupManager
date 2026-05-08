@@ -136,19 +136,23 @@ def _build_connection_config(
 def _dump_extra_options(
     *,
     extra_options: Sequence[str] | None,
+    include_database_statements: bool,
     quick: bool,
     hex_blob: bool,
 ) -> list[str]:
     """Return mysqldump extra options with helper-managed flags included.
 
     :param extra_options: Raw mysqldump options supplied by the caller.
+    :param include_database_statements: Add ``--databases`` when true so the dump contains ``CREATE DATABASE`` and ``USE`` statements.
     :param quick: Add ``--quick`` when true and not already present.
     :param hex_blob: Add ``--hex-blob`` when true and not already present.
     :return: List of extra mysqldump options.
     """
 
-    options = list(extra_options or [])
+    options = [option.strip() for option in (extra_options or [])]
     prefix: list[str] = []
+    if include_database_statements and "--databases" not in options and "-B" not in options:
+        prefix.append("--databases")
     if quick and "--quick" not in options:
         prefix.append("--quick")
     if hex_blob and "--hex-blob" not in options:
@@ -160,6 +164,7 @@ def _build_backup_manager(
     *,
     databases: Sequence[str],
     backup_dir: Path | str,
+    temp_dir: Path | str | None,
     host: str,
     port: int,
     user: str,
@@ -183,6 +188,7 @@ def _build_backup_manager(
     master_data: int | None,
     set_gtid_purged: GtidPurgedValue | None,
     where: str | None,
+    include_database_statements: bool,
     quick: bool,
     hex_blob: bool,
     ignore_tables: Sequence[str] | None,
@@ -201,6 +207,7 @@ def _build_backup_manager(
 
     :param databases: Database names that may be backed up by the manager.
     :param backup_dir: Directory where backup artifacts are written.
+    :param temp_dir: Optional directory for active hidden ``.part`` staging files. Defaults to ``~/.MysqlBackupManager`` or ``MYSQL_BACKUP_MANAGER_TEMP_DIR`` when omitted.
     :param host: MySQL server host.
     :param port: MySQL server TCP port.
     :param user: MySQL account name.
@@ -224,6 +231,7 @@ def _build_backup_manager(
     :param master_data: Optional ``--master-data`` value.
     :param set_gtid_purged: Optional ``--set-gtid-purged`` value: ``"AUTO"``, ``"ON"``, or ``"OFF"``.
     :param where: Optional ``--where`` condition.
+    :param include_database_statements: Add ``--databases`` so each dump includes ``CREATE DATABASE`` and ``USE`` statements and can select its own target database during restore.
     :param quick: Add ``--quick`` to mysqldump extra options when true.
     :param hex_blob: Add ``--hex-blob`` to mysqldump extra options when true.
     :param ignore_tables: Optional ``db.table`` entries to skip.
@@ -246,6 +254,7 @@ def _build_backup_manager(
     dump = DumpConfig(
         databases=list(databases),
         output_dir=Path(backup_dir).expanduser(),
+        temp_dir=Path(temp_dir).expanduser() if temp_dir is not None else None,
         filename_template=_DEFAULT_FILENAME_TEMPLATE,
         timestamp_format=_DEFAULT_TIMESTAMP_FORMAT,
         mysqldump_path=_DEFAULT_MYSQLDUMP_PATH,
@@ -271,6 +280,7 @@ def _build_backup_manager(
         ignore_tables=list(ignore_tables or []),
         extra_options=_dump_extra_options(
             extra_options=extra_options,
+            include_database_statements=include_database_statements,
             quick=quick,
             hex_blob=hex_blob,
         ),
@@ -322,6 +332,7 @@ def backup(
     user: str,
     backup_dir: Path | str,
     database: DatabaseSelection,
+    temp_dir: Path | str | None = None,
     host: str = "localhost",
     port: int = 3306,
     password: str | None = None,
@@ -344,6 +355,7 @@ def backup(
     master_data: int | None = None,
     set_gtid_purged: GtidPurgedValue | None = None,
     where: str | None = None,
+    include_database_statements: bool = False,
     quick: bool = True,
     hex_blob: bool = False,
     ignore_tables: Sequence[str] | None = None,
@@ -364,6 +376,7 @@ def backup(
     :param user: MySQL user for ``mysqldump`` and mysql preflight validation.
     :param backup_dir: Directory where backup artifacts and checksum sidecars are written.
     :param database: Required backup target. Pass one database name as a string, or multiple names as a sequence of strings.
+    :param temp_dir: Optional directory for active hidden ``.part`` staging files. Use this when the default ``~/.MysqlBackupManager`` is not on suitable storage.
     :param host: MySQL host.
     :param port: MySQL port.
     :param password: Optional MySQL password. Passed through ``MYSQL_PWD`` and never command args.
@@ -386,6 +399,7 @@ def backup(
     :param master_data: Optional ``--master-data`` value.
     :param set_gtid_purged: Optional ``--set-gtid-purged`` value: ``"AUTO"``, ``"ON"``, or ``"OFF"``.
     :param where: Optional ``--where`` condition for partial dumps.
+    :param include_database_statements: Add ``--databases`` so the dump includes ``CREATE DATABASE`` and ``USE`` statements. Use this when you want restore to select the database from the file without passing ``target_database``.
     :param quick: Add ``--quick`` to mysqldump options. Defaults to true for streaming large tables efficiently.
     :param hex_blob: Add ``--hex-blob`` to dump binary string columns using hexadecimal notation.
     :param ignore_tables: Optional ``db.table`` entries to skip.
@@ -422,6 +436,7 @@ def backup(
     manager = _build_backup_manager(
         databases=database_names,
         backup_dir=backup_dir,
+        temp_dir=temp_dir,
         host=host,
         port=port,
         user=user,
@@ -445,6 +460,7 @@ def backup(
         master_data=master_data,
         set_gtid_purged=set_gtid_purged,
         where=where,
+        include_database_statements=include_database_statements,
         quick=quick,
         hex_blob=hex_blob,
         ignore_tables=ignore_tables,
@@ -475,6 +491,8 @@ def restore(
     *,
     user: str,
     backup_file: Path | str,
+    target_database: str | None = None,
+    create_database_if_missing: bool = False,
     host: str = "localhost",
     port: int = 3306,
     password: str | None = None,
@@ -491,13 +509,15 @@ def restore(
 ) -> RestoreReturn:
     """Run one synchronous restore session using convenient helper parameters.
 
-    The helper streams input into ``mysql`` from the current ``PATH`` and does
-    not pass a target database name. Use ``RestoreConfig`` and ``RestoreService``
-    directly when a custom executable path or explicit target database is
-    required.
+    The helper streams input into ``mysql`` from the current ``PATH``. Pass
+    ``target_database`` when restoring a plain dump that does not contain its own
+    ``USE`` statement, or leave it as ``None`` for dumps created with
+    ``include_database_statements=True``.
 
     :param user: MySQL user for the target restore server.
-    :param backup_file: SQL or SQL.GZ backup file to stream into mysql. ``~`` is expanded. The helper does not pass a target database to ``mysql``; the dump should contain its own ``CREATE DATABASE`` and ``USE`` statements when database selection is required.
+    :param backup_file: SQL or SQL.GZ backup file to stream into mysql. ``~`` is expanded.
+    :param target_database: Optional database selected for restore. Use this for plain dumps that do not contain ``CREATE DATABASE`` or ``USE`` statements. When omitted, the dump must select its own database.
+    :param create_database_if_missing: When true, inject ``CREATE DATABASE IF NOT EXISTS`` and ``USE`` for ``target_database`` before streaming the dump. Requires ``target_database``.
     :param host: Target MySQL host.
     :param port: Target MySQL port.
     :param password: Optional MySQL password. Passed through ``MYSQL_PWD`` and never command args.
@@ -512,7 +532,7 @@ def restore(
     :param return_result: Return the ``RestoreResult`` model instead of ``None``.
     :param logger: Optional logger for restore lifecycle messages.
     :return: ``None`` by default, or ``RestoreResult`` when ``return_result=True``.
-    :raises ValueError: If ``raise_on_failure=False`` is used without ``return_result=True``.
+    :raises ValueError: If ``raise_on_failure=False`` is used without ``return_result=True``, or if ``create_database_if_missing=True`` is used without ``target_database``.
     :raises RuntimeError: If checksum verification fails or restore fails while ``raise_on_failure=True``.
 
     ## Example:
@@ -522,6 +542,8 @@ def restore(
         password="secret",
         host="db.example.com",
         backup_file=Path("~/backups/app.sql.gz"),
+        target_database="app",
+        create_database_if_missing=True,
         verify_checksum_before_restore=True,
     )
     ```
@@ -529,6 +551,8 @@ def restore(
 
     if not raise_on_failure and not return_result:
         raise ValueError("return_result=True is required when raise_on_failure=False")
+    if create_database_if_missing and not target_database:
+        raise ValueError("target_database is required when create_database_if_missing=True")
 
     resolved_backup_file = Path(backup_file).expanduser()
     if verify_checksum_before_restore:
@@ -542,11 +566,11 @@ def restore(
         socket=socket,
     )
     config = RestoreConfig(
-        database=None,
+        database=target_database,
         input_file=resolved_backup_file,
         mysql_path=_DEFAULT_MYSQL_PATH,
         command_timeout=command_timeout,
-        create_database_if_missing=False,
+        create_database_if_missing=create_database_if_missing,
         strip_gtid_purged=strip_gtid_purged,
         force=force,
         extra_options=list(extra_options or []),
@@ -557,6 +581,13 @@ def restore(
 
     if not result.success and raise_on_failure:
         message = f"Restore failed: {result.error}"
+        stderr = result.stderr or ""
+        if "No database selected" in stderr and target_database is None:
+            message = (
+                f"{message}. The dump does not appear to select a database; "
+                "pass target_database='your_db' or create future backups with "
+                "include_database_statements=True."
+            )
         if result.stderr:
             message = f"{message}\nSTDERR: {result.stderr}"
         raise RuntimeError(message)
@@ -569,6 +600,7 @@ def scheduled_backup(
     user: str,
     backup_dir: Path | str,
     database: DatabaseSelection,
+    temp_dir: Path | str | None = None,
     host: str = "localhost",
     port: int = 3306,
     password: str | None = None,
@@ -591,6 +623,7 @@ def scheduled_backup(
     master_data: int | None = None,
     set_gtid_purged: GtidPurgedValue | None = None,
     where: str | None = None,
+    include_database_statements: bool = False,
     quick: bool = True,
     hex_blob: bool = False,
     ignore_tables: Sequence[str] | None = None,
@@ -619,6 +652,7 @@ def scheduled_backup(
     :param user: MySQL user for ``mysqldump`` and mysql preflight validation.
     :param backup_dir: Directory where backup artifacts and checksum sidecars are written.
     :param database: Required scheduled backup target. Pass one database name as a string, or multiple names as a sequence of strings.
+    :param temp_dir: Optional directory for active hidden ``.part`` staging files. Use this when the default ``~/.MysqlBackupManager`` is not on suitable storage.
     :param host: MySQL host.
     :param port: MySQL port.
     :param password: Optional MySQL password. Passed through ``MYSQL_PWD`` and never command args.
@@ -641,6 +675,7 @@ def scheduled_backup(
     :param master_data: Optional ``--master-data`` value.
     :param set_gtid_purged: Optional ``--set-gtid-purged`` value: ``"AUTO"``, ``"ON"``, or ``"OFF"``.
     :param where: Optional ``--where`` condition for partial dumps.
+    :param include_database_statements: Add ``--databases`` so scheduled dumps include ``CREATE DATABASE`` and ``USE`` statements. Use this when scheduled backups should restore without passing ``target_database``.
     :param quick: Add ``--quick`` to mysqldump options. Defaults to true for streaming large tables efficiently.
     :param hex_blob: Add ``--hex-blob`` to dump binary string columns using hexadecimal notation.
     :param ignore_tables: Optional ``db.table`` entries to skip.
@@ -689,6 +724,7 @@ def scheduled_backup(
     manager = _build_backup_manager(
         databases=database_names,
         backup_dir=backup_dir,
+        temp_dir=temp_dir,
         host=host,
         port=port,
         user=user,
@@ -712,6 +748,7 @@ def scheduled_backup(
         master_data=master_data,
         set_gtid_purged=set_gtid_purged,
         where=where,
+        include_database_statements=include_database_statements,
         quick=quick,
         hex_blob=hex_blob,
         ignore_tables=ignore_tables,

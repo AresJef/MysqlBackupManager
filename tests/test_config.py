@@ -230,3 +230,16 @@ def test_dump_config_can_disable_stale_temp_cleanup(tmp_path: Path) -> None:
 
     assert config.cleanup_stale_temp_files is False
     assert config.stale_temp_file_age_seconds is None
+
+
+def test_dump_config_validates_temp_dir(tmp_path: Path) -> None:
+    temp_dir = tmp_path / "manager-temp"
+    config = DumpConfig(databases=["app"], output_dir=tmp_path / "backups", temp_dir=temp_dir)
+
+    assert config.temp_dir == temp_dir
+    assert not temp_dir.exists()
+
+    file_path = tmp_path / "not-a-dir"
+    file_path.write_text("x", encoding="utf-8")
+    with pytest.raises(BackupConfigError):
+        DumpConfig(databases=["app"], output_dir=tmp_path / "other-backups", temp_dir=file_path)

@@ -330,7 +330,7 @@ DumpConfig(
 )
 ```
 
-The backup flow writes the raw dump to a hidden temporary `.part` file in `output_dir`, moves it into place, then compresses through another hidden temporary file. Normal failures and Ctrl+C cancellation clean up the active temp file. A non-catchable kill such as `kill -9` or a power loss can still leave stale `.part` files; by default, future backups make a best-effort pass to remove library-created UUID-shaped `.part` files older than one day.
+The backup flow writes active dump and compression staging files as hidden `.part` files in the backup temp directory, then publishes only the completed `.sql` or `.sql.gz` artifact plus its checksum sidecar into `output_dir`. By default the temp directory is `~/.MysqlBackupManager`; set `DumpConfig.temp_dir` or the `MYSQL_BACKUP_MANAGER_TEMP_DIR` environment variable when you want a different location. Normal failures and Ctrl+C cancellation clean up the active temp files. A non-catchable kill such as `kill -9` or a power loss can still leave stale `.part` files; by default, future backups make a best-effort pass to remove library-created UUID-shaped `.part` files older than one day.
 
 ### Checksums
 
@@ -634,7 +634,7 @@ The scheduler skips a run if the previous backup is still active.
 
 ## Helper Functions
 
-`mysql_backup_manager.helper` provides the easiest synchronous API for starting backup, restore, and scheduled backup sessions without manually creating `MySQLBackupManager`, `DumpConfig`, `RestoreConfig`, `ScheduleConfig`, or `RetentionConfig`.
+The package-level helper functions provide the easiest synchronous API for starting backup, restore, and scheduled backup sessions without manually creating `MySQLBackupManager`, `DumpConfig`, `RestoreConfig`, `ScheduleConfig`, or `RetentionConfig`. Import them directly from `mysql_backup_manager`.
 
 The helper functions are general-purpose. They expose the options most callers need and keep lower-level details on sensible defaults: UTF-8 character set, 10 second connection timeout, standard timestamped filenames, `mysqldump`/`mysql` executable names from `PATH`, gzip compression format, and SHA-256 checksums. Use `MySQLBackupManager`, `DumpConfig`, and `RestoreConfig` directly when you need custom native executable paths.
 
@@ -643,7 +643,7 @@ The helper functions are general-purpose. They expose the options most callers n
 ```python
 from pathlib import Path
 
-from mysql_backup_manager.helper import backup
+from mysql_backup_manager import backup
 
 backup_file = backup(
     user="backup_user",
@@ -654,6 +654,7 @@ backup_file = backup(
     backup_dir=Path("~/backups"),
     compress=True,
     generate_checksum=True,
+    include_database_statements=True,
     hex_blob=True,
     command_timeout=3600,
 )
@@ -664,7 +665,7 @@ print("Backup file:", backup_file)
 For multiple databases, pass a list to the same `database` argument. The helper returns a list of paths unless `return_results=True` is used:
 
 ```python
-from mysql_backup_manager.helper import backup
+from mysql_backup_manager import backup
 
 results = backup(
     user="backup_user",
@@ -683,14 +684,14 @@ for result in results:
 Common backup options available directly on `backup()` include:
 
 - Connection: `host`, `port`, `user`, `password`, `socket`
-- Output: `backup_dir`, `overwrite`
+- Output: `backup_dir`, `temp_dir`, `overwrite`
 - Native client: `command_timeout`
-- Dump behavior: `single_transaction`, `routines`, `triggers`, `events`, `add_drop_database`, `add_drop_table`, `create_options`, `lock_tables`, `flush_logs`, `master_data`, `set_gtid_purged`, `where`, `ignore_tables`, `extra_options`, `quick`, `hex_blob`
+- Dump behavior: `single_transaction`, `routines`, `triggers`, `events`, `add_drop_database`, `add_drop_table`, `create_options`, `lock_tables`, `flush_logs`, `master_data`, `set_gtid_purged`, `where`, `include_database_statements`, `ignore_tables`, `extra_options`, `quick`, `hex_blob`
 - Safety checks: `validate_database_exists`, `validate_database_has_objects`, `validate_dump_content`, `cleanup_stale_temp_files`, `stale_temp_file_age_seconds`
 - Artifacts: `compress`, `generate_checksum`
 - Return behavior: `raise_on_failure`, `return_results`
 
-`quick=True` by default, which adds `--quick` so `mysqldump` streams rows instead of buffering large tables in memory. Set `quick=False` if you explicitly do not want that option. Set `hex_blob=True` to add `--hex-blob`, which dumps binary string columns using hexadecimal notation.
+`quick=True` by default, which adds `--quick` so `mysqldump` streams rows instead of buffering large tables in memory. Set `quick=False` if you explicitly do not want that option. Set `hex_blob=True` to add `--hex-blob`, which dumps binary string columns using hexadecimal notation. Set `include_database_statements=True` to add `--databases`, which writes `CREATE DATABASE` and `USE` statements into the dump so restore can select the database from the file. Set `temp_dir` only when the default staging location `~/.MysqlBackupManager` is not on suitable storage.
 
 For a GTID-aware replica bootstrap dump, opt into the relevant MySQL flags explicitly:
 
@@ -704,8 +705,8 @@ backup_file = backup(
     compress=True,
     generate_checksum=True,
     set_gtid_purged="AUTO",
+    include_database_statements=True,
     hex_blob=True,
-    extra_options=["--databases"],
     command_timeout=7200,
 )
 ```
@@ -715,19 +716,26 @@ backup_file = backup(
 ```python
 from pathlib import Path
 
-from mysql_backup_manager.helper import restore
+from mysql_backup_manager import restore
 
 restore(
     user="restore_user",
     password="secret",
     host="db.example.com",
     backup_file=Path("~/backups/app_20260507_020000.sql.gz"),
+    target_database="app",
+    create_database_if_missing=True,
     decompress=True,
     command_timeout=3600,
 )
 ```
 
-The simplified helper streams the backup file into `mysql` without passing a target database name. For database selection, create dumps with `--databases` so the file contains `CREATE DATABASE` and `USE` statements. Use the lower-level `RestoreConfig` API when you need to force a separate target database or inject `CREATE DATABASE IF NOT EXISTS`.
+There are two supported database-selection styles:
+
+1. Self-selecting dumps: create the backup with `include_database_statements=True`. The dump contains `CREATE DATABASE` and `USE`, so restore can leave `target_database=None`. This is usually best for scheduled backups, same-name restores, and replica/bootstrap workflows.
+2. Plain dumps: leave `include_database_statements=False` during backup, then pass `target_database="app"` during restore. If that database may not exist yet, also pass `create_database_if_missing=True`. This is usually best when restoring into a new database name such as `app_copy`.
+
+If MySQL returns `ERROR 1046 (3D000): No database selected`, your dump is plain and restore needs `target_database`, or future backups should use `include_database_statements=True`.
 
 `restore()` can also return the full `RestoreResult` model:
 
@@ -737,6 +745,8 @@ result = restore(
     password="secret",
     host="db.example.com",
     backup_file="~/backups/app.sql.gz",
+    target_database="app_copy",
+    create_database_if_missing=True,
     verify_checksum_before_restore=True,
     return_result=True,
 )
@@ -749,7 +759,7 @@ Common restore options available directly on `restore()` include:
 - Connection: `host`, `port`, `user`, `password`, `socket`
 - Input: `backup_file`, `decompress`
 - Native client: `command_timeout`, `extra_options`
-- Restore behavior: `strip_gtid_purged`, `force`
+- Restore behavior: `target_database`, `create_database_if_missing`, `strip_gtid_purged`, `force`
 - Checksum: `verify_checksum_before_restore`
 - Return behavior: `raise_on_failure`, `return_result`
 
@@ -758,7 +768,7 @@ Common restore options available directly on `restore()` include:
 For scheduled backups, pass the same backup options plus schedule and retention options:
 
 ```python
-from mysql_backup_manager.helper import scheduled_backup
+from mysql_backup_manager import scheduled_backup
 
 scheduled_backup(
     user="backup_user",
@@ -766,11 +776,13 @@ scheduled_backup(
     host="db.example.com",
     database="app",
     backup_dir="~/backups",
+    # temp_dir="/fast-local-disk/mysql-backup-temp",
     cron="0 2 * * *",
     timezone="Asia/Shanghai",
     run_immediately=False,
     compress=True,
     generate_checksum=True,
+    include_database_statements=True,
     hex_blob=True,
     retention_enabled=True,
     keep_last=7,
@@ -780,7 +792,7 @@ scheduled_backup(
 )
 ```
 
-Use either `cron` or `interval_seconds`, not both. Cron schedules use `timezone`; interval schedules simply wait the configured number of seconds. Scheduled backups skip overlapping runs and can run retention cleanup after successful backup cycles.
+Use either `cron` or `interval_seconds`, not both. Cron schedules use `timezone`; interval schedules simply wait the configured number of seconds. Scheduled backups skip overlapping runs and can run retention cleanup after successful backup cycles. For scheduled backups, `include_database_statements=True` is a good default when you want each backup file to be self-contained for restore.
 
 ### Checksum Verification
 
@@ -812,6 +824,7 @@ verify_checksum("~/backups/app.sql.gz")
 | --- | --- | --- |
 | `databases` | required | Databases available for backup. Must not be empty. |
 | `output_dir` | required | Backup directory. Created if missing. |
+| `temp_dir` | `None` | Directory for active hidden `.part` files. When omitted, backups use `MYSQL_BACKUP_MANAGER_TEMP_DIR` if set, otherwise `~/.MysqlBackupManager`. Created when a backup runs. |
 | `filename_template` | `"{database}_{timestamp}.sql"` | Output filename template. |
 | `timestamp_format` | `"%Y%m%d_%H%M%S"` | `datetime.strftime` format. |
 | `mysqldump_path` | `"mysqldump"` | Path or executable name for `mysqldump`. |
@@ -820,7 +833,7 @@ verify_checksum("~/backups/app.sql.gz")
 | `validate_database_exists` | `True` | Verify that the requested database exists and is visible before running `mysqldump`. |
 | `validate_database_has_objects` | `True` | Verify that at least one table or view is visible before running `mysqldump`. Disable for intentionally empty databases. |
 | `validate_dump_content` | `True` | Verify that a dump with visible objects contains table/view definitions or row data before finalizing the backup artifact. |
-| `cleanup_stale_temp_files` | `True` | Best-effort removal of old hidden UUID-shaped `.part` files from interrupted backup attempts before starting a new backup. |
+| `cleanup_stale_temp_files` | `True` | Best-effort removal of old hidden UUID-shaped `.part` files from interrupted backup attempts before starting a new backup. The main cleanup target is the configured temp directory; `output_dir` is also scanned for stale temp files left by older package versions or cross-filesystem publish fallback. |
 | `stale_temp_file_age_seconds` | `86400` | Minimum `.part` file age before stale temp cleanup deletes it. Set `None` to disable age-based deletion. |
 | `single_transaction` | `True` | Add `--single-transaction`. |
 | `routines` | `True` | Add `--routines`. |
@@ -966,7 +979,7 @@ manager = MySQLBackupManager(
 - Password-bearing `extra_options` such as `--password=...` or `-psecret` are rejected.
 - `BackupResult.command` and `RestoreResult.command` do not contain passwords.
 - The library never uses `shell=True`.
-- Backup and compression output use hidden `.part` temporary files before replacing final files. Ctrl+C cancellation cleans up the active temp file when Python can handle the signal.
+- Backup and compression staging use hidden `.part` temporary files in the backup temp directory before publishing finished artifacts into `output_dir`. Ctrl+C cancellation cleans up active temp files when Python can handle the signal.
 - Retention cleanup validates paths and will not delete files outside `output_dir`.
 - Prefer a dedicated MySQL user with the minimum privileges needed for backup or restore.
 
@@ -994,7 +1007,7 @@ The unit tests do not require a real MySQL server. They focus on configuration v
 - A real restore requires `mysql` installed on the host.
 - Gzip is the only compression format currently supported.
 - Command timeouts are opt-in; set `command_timeout` for strict runtime limits.
-- `KeyboardInterrupt`/Ctrl+C can be handled gracefully, but `kill -9`, power loss, or host crashes cannot run Python cleanup handlers. Stale library-created `.part` files from those events are cleaned on later backups once they exceed `stale_temp_file_age_seconds`.
+- `KeyboardInterrupt`/Ctrl+C can be handled gracefully, but `kill -9`, power loss, or host crashes cannot run Python cleanup handlers. Stale library-created `.part` files in the backup temp directory are cleaned on later backups once they exceed `stale_temp_file_age_seconds`.
 - The core restore service does not verify checksum files automatically before restore; use `restore(..., verify_checksum_before_restore=True)` or `verify_checksum()` when you want helper-level verification.
 - This package intentionally does not provide its own command-line interface; use the Python API from your application, worker, or scheduler process.
 

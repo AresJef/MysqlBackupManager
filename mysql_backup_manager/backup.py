@@ -9,20 +9,26 @@ convenience APIs around one shared MySQL connection.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
+import os
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from mysql_backup_manager.checksum import write_checksum_file
-from mysql_backup_manager.compression import gzip_file
+from mysql_backup_manager.checksum import ChecksumName, compute_checksum
+from mysql_backup_manager.compression import gzip_file_to_path
 from mysql_backup_manager.config import DumpConfig, MySQLConnectionConfig, RestoreConfig, RetentionConfig
 from mysql_backup_manager.exceptions import MySQLBackupError, MySQLClientNotFoundError, MySQLCommandError
 from mysql_backup_manager.logging import get_logger
 from mysql_backup_manager.models import BackupResult, RestoreResult, RetentionResult
 from mysql_backup_manager.process import build_env, run_command_capture, run_command_to_file
 from mysql_backup_manager.utils import elapsed_seconds, ensure_no_running_loop, utc_now
+
+
+DEFAULT_TEMP_DIR = Path("~/.MysqlBackupManager")
 
 
 def quote_mysql_string_literal(value: str) -> str:
@@ -74,7 +80,7 @@ def dump_file_contains_database_objects(path: Path) -> bool:
 def is_backup_temp_file(path: Path) -> bool:
     """Return whether ``path`` looks like a library-created backup temp file.
 
-    :param path: Candidate path inside a backup output directory.
+    :param path: Candidate path inside a backup temp directory or legacy output-directory staging location.
     :return: ``True`` for hidden ``.part`` files whose name matches the library temp-file shape ``.<sql-name>.<uuid>.part``; otherwise ``False``. Symlinks are never treated as backup temp files.
 
     ## Example:
@@ -99,14 +105,14 @@ def is_backup_temp_file(path: Path) -> bool:
 
 
 def cleanup_stale_backup_temp_files(
-    output_dir: Path,
+    temp_dir: Path,
     *,
     older_than_seconds: float | None,
     logger: logging.Logger | None = None,
 ) -> list[Path]:
-    """Remove stale hidden ``.part`` backup files from ``output_dir``.
+    """Remove stale hidden ``.part`` backup files from a temp directory.
 
-    :param output_dir: Backup directory to inspect. Only direct child files are considered.
+    :param temp_dir: Directory to inspect. Only direct child files are considered.
     :param older_than_seconds: Minimum file age in seconds before deletion. Pass ``0`` to delete matching files immediately, or ``None`` to disable deletion.
     :param logger: Optional logger used to report deleted temp files.
     :return: List of temp files that were removed.
@@ -114,14 +120,14 @@ def cleanup_stale_backup_temp_files(
 
     ## Example:
     ```python
-    deleted = cleanup_stale_backup_temp_files(Path("./backups"), older_than_seconds=86400)
+    deleted = cleanup_stale_backup_temp_files(Path("~/.MysqlBackupManager"), older_than_seconds=86400)
     ```
     """
 
     if older_than_seconds is None:
         return []
 
-    directory = Path(output_dir).expanduser()
+    directory = Path(temp_dir).expanduser()
     if not directory.exists():
         return []
 
@@ -140,14 +146,78 @@ def cleanup_stale_backup_temp_files(
     return deleted_files
 
 
-def _new_backup_temp_file(final_path: Path) -> Path:
-    """Return a unique hidden temp path next to ``final_path``.
+def _resolve_backup_temp_dir(config: DumpConfig) -> Path:
+    """Return the directory used for active backup temp artifacts.
 
-    :param final_path: Intended final backup artifact path.
-    :return: Hidden ``.part`` path in the same directory, suitable for atomic replacement of ``final_path``.
+    :param config: Dump configuration that may contain an explicit ``temp_dir``.
+    :return: Expanded temp directory. Defaults to ``MYSQL_BACKUP_MANAGER_TEMP_DIR`` when set, otherwise ``~/.MysqlBackupManager``.
+    :raises MySQLBackupError: If the environment-provided temp path is blank or contains a null byte.
     """
 
-    return final_path.with_name(f".{final_path.name}.{uuid4().hex}.part")
+    if config.temp_dir is not None:
+        return config.temp_dir.expanduser()
+    env_value = os.getenv("MYSQL_BACKUP_MANAGER_TEMP_DIR")
+    if env_value is not None:
+        normalized = env_value.strip()
+        if not normalized:
+            raise MySQLBackupError("MYSQL_BACKUP_MANAGER_TEMP_DIR must not be empty when set")
+        if "\x00" in normalized:
+            raise MySQLBackupError("MYSQL_BACKUP_MANAGER_TEMP_DIR must not contain null bytes")
+        return Path(normalized).expanduser()
+    return DEFAULT_TEMP_DIR.expanduser()
+
+
+def _new_backup_temp_file(final_path: Path, temp_dir: Path) -> Path:
+    """Return a unique hidden temp path in ``temp_dir`` for ``final_path``.
+
+    :param final_path: Intended final backup artifact path.
+    :param temp_dir: Directory where active ``.part`` files should be written.
+    :return: Hidden ``.part`` path in ``temp_dir`` whose name is derived from the final artifact name.
+    """
+
+    return temp_dir / f".{final_path.name}.{uuid4().hex}.part"
+
+
+def _publish_temp_file(temp_path: Path, final_path: Path) -> None:
+    """Publish a completed temp artifact to its final path.
+
+    :param temp_path: Completed temporary file, normally located in the backup temp directory.
+    :param final_path: Final path in the backup output directory. Existing files are replaced by ``Path.replace``.
+    :return: None.
+    :raises OSError: If publishing fails. A cross-filesystem move falls back to copying through a hidden temp file in the final directory so a partial final filename is not exposed.
+    """
+
+    try:
+        temp_path.replace(final_path)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    fallback_temp = _new_backup_temp_file(final_path, final_path.parent)
+    try:
+        shutil.copyfile(temp_path, fallback_temp)
+        fallback_temp.replace(final_path)
+    finally:
+        fallback_temp.unlink(missing_ok=True)
+        temp_path.unlink(missing_ok=True)
+
+
+def _write_checksum_temp_file(path: Path, temp_path: Path, algorithm: ChecksumName) -> str:
+    """Write a checksum sidecar body into a temporary file and return the digest.
+
+    :param path: Final backup artifact to checksum.
+    :param temp_path: Temporary sidecar path that will later be published to the backup directory.
+    :param algorithm: Hash algorithm name supported by ``compute_checksum``.
+    :return: Lowercase hexadecimal checksum digest.
+    :raises FileNotFoundError: If ``path`` does not exist.
+    :raises OSError: If the temporary checksum file cannot be written.
+    """
+
+    checksum = compute_checksum(path, algorithm)
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path.write_text(f"{checksum}  {path.name}\n", encoding="utf-8")
+    return checksum
 
 
 class BackupService:
@@ -427,10 +497,12 @@ class BackupService:
 
         started_at = utc_now()
         output_file = self.build_output_path(database, now=started_at)
-        temp_output_file = _new_backup_temp_file(output_file)
+        temp_dir = _resolve_backup_temp_dir(self.config)
+        temp_output_file = _new_backup_temp_file(output_file, temp_dir)
         command = self.build_command(database)
         compressed_file: Path | None = None
         checksum_file: Path | None = None
+        temp_checksum_file: Path | None = None
         checksum: str | None = None
         stderr: str | None = None
         error: str | None = None
@@ -438,16 +510,22 @@ class BackupService:
         visible_objects: int | None = None
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
         if self.config.cleanup_stale_temp_files:
-            try:
-                cleanup_stale_backup_temp_files(
-                    self.config.output_dir,
-                    older_than_seconds=self.config.stale_temp_file_age_seconds,
-                    logger=self.logger,
-                )
-            except OSError as exc:
-                self.logger.warning("Failed to remove stale backup temp files: %s", exc)
+            cleanup_dirs = [temp_dir]
+            if self.config.output_dir != temp_dir:
+                cleanup_dirs.append(self.config.output_dir)
+            for cleanup_dir in cleanup_dirs:
+                try:
+                    cleanup_stale_backup_temp_files(
+                        cleanup_dir,
+                        older_than_seconds=self.config.stale_temp_file_age_seconds,
+                        logger=self.logger,
+                    )
+                except OSError as exc:
+                    self.logger.warning("Failed to remove stale backup temp files in %s: %s", cleanup_dir, exc)
         expected_final_file = output_file.with_suffix(output_file.suffix + ".gz") if self.config.compress else output_file
+        temp_compressed_file = _new_backup_temp_file(expected_final_file, temp_dir) if self.config.compress else None
         collision_candidates = [expected_final_file]
         if self.config.compress:
             collision_candidates.append(output_file)
@@ -505,17 +583,24 @@ class BackupService:
                     f"mysqldump for database `{database}` completed but produced no table definitions or row data; "
                     "verify mysqldump options and backup user privileges"
                 )
-            temp_output_file.replace(output_file)
-            final_file = output_file
             if self.config.compress:
-                compressed_file = await asyncio.to_thread(
-                    gzip_file, output_file, remove_original=True
+                assert temp_compressed_file is not None
+                await asyncio.to_thread(
+                    gzip_file_to_path, temp_output_file, temp_compressed_file, remove_original=True
                 )
+                compressed_file = expected_final_file
                 final_file = compressed_file
+                _publish_temp_file(temp_compressed_file, final_file)
+            else:
+                final_file = output_file
+                _publish_temp_file(temp_output_file, final_file)
             if self.config.generate_checksum:
-                checksum_file, checksum = await asyncio.to_thread(
-                    write_checksum_file, final_file, self.config.checksum_algorithm
+                checksum_file = final_file.with_name(f"{final_file.name}.{self.config.checksum_algorithm}")
+                temp_checksum_file = _new_backup_temp_file(checksum_file, temp_dir)
+                checksum = await asyncio.to_thread(
+                    _write_checksum_temp_file, final_file, temp_checksum_file, self.config.checksum_algorithm
                 )
+                _publish_temp_file(temp_checksum_file, checksum_file)
             success = True
             self.logger.info("Backup succeeded for database `%s`: %s", database, final_file)
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -538,6 +623,10 @@ class BackupService:
             self.logger.exception("Backup failed for database `%s`", database)
         finally:
             temp_output_file.unlink(missing_ok=True)
+            if temp_compressed_file is not None:
+                temp_compressed_file.unlink(missing_ok=True)
+            if temp_checksum_file is not None:
+                temp_checksum_file.unlink(missing_ok=True)
 
         finished_at = utc_now()
         final_path = compressed_file or output_file
