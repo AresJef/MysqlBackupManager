@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mysql-backup-manager"
-version = "1.0.2"
+version = "1.0.3"
 description = "Production-ready Python library for MySQL backup and restore using native MySQL client tools."
 readme = "README.md"
 requires-python = ">=3.11"
