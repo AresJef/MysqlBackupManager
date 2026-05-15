@@ -638,8 +638,8 @@ def scheduled_backup(
     run_immediately: bool = False,
     stop_on_failure: bool = True,
     retention_enabled: bool = True,
-    keep_last: int | None = 10,
-    keep_days: int | None = 30,
+    keep_last: int | None = None,
+    keep_days: int | None = None,
     match_pattern: str = "*.sql*",
     logger: logging.Logger | None = None,
 ) -> None:
@@ -690,8 +690,8 @@ def scheduled_backup(
     :param run_immediately: Run one backup before waiting for the first scheduled time.
     :param stop_on_failure: Raise and stop the loop when a scheduled cycle fails.
     :param retention_enabled: Enable retention cleanup after successful scheduled backups.
-    :param keep_last: Delete matching backup artifacts beyond this newest-file count. Set ``None`` to disable.
-    :param keep_days: Delete matching backup artifacts older than this many days. Set ``None`` to disable.
+    :param keep_last: Delete matching backup artifacts beyond this newest-file count. Defaults to ``None``, which disables the newest-file-count rule.
+    :param keep_days: Delete matching backup artifacts older than this many days. Defaults to ``None``, which disables the age rule.
     :param match_pattern: Retention glob pattern inside ``backup_dir``.
     :param logger: Optional logger for scheduler, backup, and retention messages.
     :return: None. Enabled schedules run until interrupted or cancelled.
@@ -708,8 +708,8 @@ def scheduled_backup(
         timezone="Asia/Shanghai",
         compress=True,
         hex_blob=True,
-        keep_last=7,
-        keep_days=30,
+        keep_last=None,
+        keep_days=7,
     )
     ```
     """

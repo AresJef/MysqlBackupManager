@@ -652,7 +652,7 @@ class MySQLBackupManager:
 
     :param connection: Shared ``MySQLConnectionConfig`` for both backup and restore client commands.
     :param dump: ``DumpConfig`` defining the backup workspace and allowed databases.
-    :param retention: Optional ``RetentionConfig``. Defaults to enabled retention with the library defaults.
+    :param retention: Optional ``RetentionConfig``. Defaults to enabled retention with no deletion limits until ``keep_last`` or ``keep_days`` is configured.
     :param logger: Optional logger used by all services created by the manager.
     :return: A reusable ``MySQLBackupManager`` instance.
 
@@ -679,7 +679,7 @@ class MySQLBackupManager:
 
         :param connection: Connection settings for native MySQL client tools.
         :param dump: Backup configuration. Required because the manager owns the backup workspace and retention directory even when only restore methods are used.
-        :param retention: Optional retention policy. ``RetentionConfig()`` is used when omitted.
+        :param retention: Optional retention policy. ``RetentionConfig()`` is used when omitted, which enables retention cleanup but does not delete by age or count until limits are configured.
         :param logger: Optional logger shared with backup, restore, and retention services.
         :return: None. The constructor builds service objects but does not run backups.
         """

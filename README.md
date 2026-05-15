@@ -785,14 +785,14 @@ scheduled_backup(
     include_database_statements=True,
     hex_blob=True,
     retention_enabled=True,
-    keep_last=7,
-    keep_days=30,
+    keep_last=None,
+    keep_days=7,
     match_pattern="app_*.sql*",
     command_timeout=3600,
 )
 ```
 
-Use either `cron` or `interval_seconds`, not both. Cron schedules use `timezone`; interval schedules simply wait the configured number of seconds. Scheduled backups skip overlapping runs and can run retention cleanup after successful backup cycles. For scheduled backups, `include_database_statements=True` is a good default when you want each backup file to be self-contained for restore.
+Use either `cron` or `interval_seconds`, not both. Cron schedules use `timezone`; interval schedules simply wait the configured number of seconds. Scheduled backups skip overlapping runs and can run retention cleanup after successful backup cycles. In the helper API, `keep_last` and `keep_days` both default to `None`; pass only the limit you want, or pass both when a backup must satisfy both limits to be kept. For scheduled backups, `include_database_statements=True` is a good default when you want each backup file to be self-contained for restore.
 
 ### Checksum Verification
 
@@ -886,8 +886,8 @@ Use either `cron` or `interval_seconds`, not both. If `enabled=True`, one of the
 | Field | Default | Description |
 | --- | --- | --- |
 | `enabled` | `True` | Whether cleanup is enabled. |
-| `keep_last` | `10` | Delete matching backup artifacts beyond the newest N files. Use `None` to disable. |
-| `keep_days` | `30` | Delete matching backup artifacts older than this many days. Use `None` to disable. |
+| `keep_last` | `None` | Delete matching backup artifacts beyond the newest N files. Use `None` to disable. |
+| `keep_days` | `None` | Delete matching backup artifacts older than this many days. Use `None` to disable. |
 | `match_pattern` | `"*.sql*"` | Glob pattern inside `output_dir`. |
 
 ## Result Models

@@ -126,6 +126,24 @@ def test_retention_match_pattern_must_stay_inside_output_dir() -> None:
         RetentionConfig(match_pattern="../*.sql")
 
 
+def test_retention_config_omitted_limits_are_disabled() -> None:
+    from mysql_backup_manager.config import RetentionConfig
+
+    config = RetentionConfig(keep_days=7)
+
+    assert config.keep_last is None
+    assert config.keep_days == 7
+
+
+def test_retention_config_defaults_do_not_delete_by_count_or_age() -> None:
+    from mysql_backup_manager.config import RetentionConfig
+
+    config = RetentionConfig()
+
+    assert config.keep_last is None
+    assert config.keep_days is None
+
+
 def test_output_dir_expands_user_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
 

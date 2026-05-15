@@ -437,6 +437,40 @@ def test_scheduled_backup_helper_wires_schedule_and_retention(
     assert scheduler.stop_on_failure is False
 
 
+def test_scheduled_backup_helper_omitted_keep_last_disables_keep_last(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeManager:
+        instances = []
+
+        def __init__(self, connection, dump, retention=None, logger=None) -> None:
+            self.retention = retention
+            self.__class__.instances.append(self)
+
+    class FakeScheduler:
+        def __init__(self, manager, config, logger=None) -> None:
+            self.manager = manager
+
+        async def run_forever(self, *, stop_on_failure: bool = False) -> None:
+            return None
+
+    monkeypatch.setattr(helper, "MySQLBackupManager", FakeManager)
+    monkeypatch.setattr(helper, "SchedulerService", FakeScheduler)
+
+    helper.scheduled_backup(
+        user="root",
+        backup_dir=tmp_path,
+        database="app",
+        interval_seconds=60,
+        keep_days=7,
+    )
+
+    retention = FakeManager.instances[-1].retention
+    assert retention.keep_last is None
+    assert retention.keep_days == 7
+
+
 def test_verify_checksum_supports_md5(tmp_path: Path) -> None:
     backup = tmp_path / "backup.sql"
     backup.write_text("SELECT 1;", encoding="utf-8")

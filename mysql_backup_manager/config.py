@@ -564,8 +564,8 @@ class RetentionConfig(BaseModel):
     """Configuration for deleting old backup files from an output directory.
 
     :param enabled: Disable cleanup entirely when false.
-    :param keep_last: Delete matching backup artifacts beyond the newest N files. Set to ``None`` to disable this deletion rule.
-    :param keep_days: Delete matching backup artifacts older than this many days. Set to ``None`` to disable this deletion rule.
+    :param keep_last: Delete matching backup artifacts beyond the newest N files. Defaults to ``None``, which disables this deletion rule.
+    :param keep_days: Delete matching backup artifacts older than this many days. Defaults to ``None``, which disables this deletion rule.
     :param match_pattern: Relative glob used inside the backup directory, for example ``"*.sql*"`` or ``"app_*.sql*"``.
     :return: A validated ``RetentionConfig`` instance.
 
@@ -579,8 +579,8 @@ class RetentionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    keep_last: int | None = Field(default=10, ge=0)
-    keep_days: int | None = Field(default=30, ge=0)
+    keep_last: int | None = Field(default=None, ge=0)
+    keep_days: int | None = Field(default=None, ge=0)
     match_pattern: str = "*.sql*"
 
     @field_validator("match_pattern")

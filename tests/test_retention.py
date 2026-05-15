@@ -34,6 +34,26 @@ def test_retention_keeps_last_and_deletes_older_files(tmp_path: Path) -> None:
     assert second.exists()
 
 
+def test_retention_keep_days_without_keep_last_deletes_only_by_age(tmp_path: Path) -> None:
+    newest = tmp_path / "newest.sql"
+    second = tmp_path / "second.sql"
+    old = tmp_path / "old.sql"
+    _touch(newest, 0)
+    _touch(second, 1)
+    _touch(old, 8)
+
+    result = RetentionService(
+        tmp_path,
+        RetentionConfig(keep_last=None, keep_days=7),
+    ).cleanup()
+
+    assert result.success
+    assert newest.exists()
+    assert second.exists()
+    assert not old.exists()
+    assert old in result.deleted_files
+
+
 def test_retention_deletes_files_that_exceed_either_policy(tmp_path: Path) -> None:
     recent = tmp_path / "recent.sql"
     old_but_last = tmp_path / "old_but_last.sql"
